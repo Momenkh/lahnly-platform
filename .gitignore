@@ -7,7 +7,6 @@
 **/*.aac
 **/*.ogg
 
-pipeline/
 __pycache__/
 *.pyc
 .env
