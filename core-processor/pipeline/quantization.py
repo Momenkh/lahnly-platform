@@ -95,10 +95,14 @@ def quantize_notes(
     print(f"[Stage 4] Snapped {snapped}/{len(notes)} note starts to grid")
 
     # Snap durations to the nearest subdivision using the same tolerance.
-    # Minimum snapped duration = 1 subdivision (never collapse to zero).
+    # Very short articulations (< 0.5 × subdivision) are left untouched —
+    # hammer-ons, pull-offs, and ghost notes below this threshold should not
+    # be elongated to the nearest grid point.
     dur_snapped = 0
     for note in quantized:
         raw_dur = note["duration"]
+        if raw_dur < 0.5 * subdiv_s:
+            continue   # leave very short articulations at their original duration
         nearest_dur = max(subdiv_s, round(raw_dur / subdiv_s) * subdiv_s)
         if abs(nearest_dur - raw_dur) <= tolerance:
             note["duration"] = round(nearest_dur, 4)

@@ -150,7 +150,6 @@ MAPPING_CONTEXT_OPEN_STRING_EXEMPT = True  # fret=0 skips the context penalty
 # Acoustic and rhythm guitar: no floor — these styles often include bass
 # melody notes or deliberately use low strings as melodic elements.
 MELODY_MIN_PITCH = {
-    "lead":     50,   # D3 — filters low-string bleed from melody
-    "acoustic":  0,   # no floor — bass notes are legitimate in fingerpicking
-    "rhythm":    0,   # no floor — chord bass notes are handled by chord detection
+    "lead":   50,   # D3 — filters low-string bleed from lead melody line
+    "rhythm":  0,   # no floor — bass chord tones are legitimate
 }

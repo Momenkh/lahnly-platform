@@ -17,6 +17,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from matplotlib.patches import FancyBboxPatch
 
 from pipeline.config import get_outputs_dir
@@ -37,6 +38,12 @@ from pipeline.settings import (
 )
 
 STRING_NAMES = {1: "e", 2: "B", 3: "G", 4: "D", 5: "A", 6: "E"}
+
+
+def _fmt_mmss(x: float, _) -> str:
+    m = int(x) // 60
+    s = int(x) % 60
+    return f"{m}:{s:02d}"
 
 # Visual thickness per string (thin at top -> thick at bottom)
 STRING_LW = {1: 0.8, 2: 1.1, 3: 1.5, 4: 2.0, 5: 2.6, 6: 3.3}
@@ -146,15 +153,14 @@ def plot_fretboard(
         )
         ax.tick_params(axis="y", length=0)
         ax.tick_params(axis="x", labelsize=7)
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(_fmt_mmss))
 
-        ax.set_xlabel(f"Time (s)  [{t_start:.0f}s - {t_end:.0f}s]", fontsize=7)
-
-        minutes = int(t_start // 60)
-        seconds = int(t_start % 60)
-        end_m   = int(t_end // 60)
-        end_s   = int(t_end % 60)
+        ax.set_xlabel(
+            f"[{_fmt_mmss(t_start, None)} — {_fmt_mmss(t_end, None)}]",
+            fontsize=7,
+        )
         ax.set_title(
-            f"{minutes}:{seconds:02d} - {end_m}:{end_s:02d}",
+            f"{_fmt_mmss(t_start, None)} — {_fmt_mmss(t_end, None)}",
             fontsize=8, loc="left", pad=3,
         )
 

@@ -54,13 +54,39 @@ SEPARATION_MODELS = [
 # Formula: stem_confidence = base_conf * 0.7 + energy_ratio * 0.3
 #   base_conf    — model-level prior (below); 6s/guitar is most reliable
 #   energy_ratio — how much energy survived separation relative to the input
-#
-# The blended output is: alpha * stem + (1 − alpha) * original_mix
-# where alpha = stem_confidence.  A low-confidence stem blends in the original
-# to recover transients and brightness that the model stripped out.
 SEPARATION_MODEL_BASE_CONF = {
     ("htdemucs_6s",       "guitar"): 0.85,   # dedicated stem — high prior
     ("htdemucs_ft_other", "other"):  0.60,   # generic "other" — moderate prior
     ("htdemucs",          "other"):  0.45,   # base model — lower prior
     ("raw mix",           "mix"):    0.20,   # fallback: no separation at all
 }
+
+# ── Raw mix blending ───────────────────────────────────────────────────────────
+# When True, a small portion of the original mix is added back into the stem to
+# recover transients and high-frequency brightness that Demucs strips from
+# low-confidence stems.
+#
+# Formula:
+#   raw_weight = SEPARATION_MAX_RAW_BLEND × (1 − confidence)
+#   output     = confidence × stem + raw_weight × raw_mix
+#
+# Example at confidence=0.70: 70% stem + 9% raw  (not 30% — intentionally asymmetric)
+# Example at confidence=0.90: 90% stem + 3% raw
+# Example at confidence=0.40: 40% stem + 18% raw
+#
+# The raw contribution is a fraction of a fraction so it stays small even when
+# confidence is low. This also limits bleed during silent sections of the stem
+# (no guitar playing) — only raw_weight of the full mix leaks through instead of
+# the full (1 − confidence) that a naive linear blend would produce.
+#
+# SEPARATION_MAX_RAW_BLEND caps how much raw can ever contribute (at confidence=0).
+# Raise it if the stem sounds too dry; lower it if you hear too much bleed.
+#
+# SEPARATION_BLEND_GATE_WINDOW controls the granularity of the silence gate.
+# The stem is split into windows of this size; windows whose RMS is below
+# SEPARATION_RMS_SILENCE_THRESH get a gate value of 0 (no raw bleed).
+# ~93ms at 44100 Hz is fine-grained enough to catch note attacks while
+# being coarse enough to avoid flickering on sustained notes.
+SEPARATION_MIX_WITH_RAW      = False
+SEPARATION_MAX_RAW_BLEND     = 0.30
+SEPARATION_BLEND_GATE_WINDOW = 4096   # samples (~93ms at 44100 Hz)

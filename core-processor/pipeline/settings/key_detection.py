@@ -21,13 +21,11 @@ Mixolydian) or multi-key / modulating-key detection.
 # Score bonus added to the Krumhansl-Schmuckler correlation for the pentatonic
 # minor key interpretation during scale selection.
 #
-# Why pentatonic minor?  It is by far the most common scale in lead guitar
-# (blues, rock, metal, country).  When the KS scores for major and pentatonic
-# minor are close, this bonus tips the decision toward minor — which is
-# almost always the right answer for guitar solos.
+# Applied ONLY when the top-2 scale candidates are within KEY_PENTA_BIAS_GATE
+# of each other (score gap ≤ gate). This prevents a fixed bias from overriding
+# a clear major-key reading; it only tips close calls toward minor.
 #
-# 0.04 is conservative: large enough to break ties but too small to override
-# a clear major reading (typical KS score differences of 0.1–0.3).
-# Raise toward 0.10 if you find the algorithm keeps calling minor-sounding
-# solos "major"; lower toward 0.01 if you work mostly with major-key material.
-KEY_PENTATONIC_MINOR_BIAS = 0.04
+# KEY_PENTATONIC_MINOR_BIAS = 0.01: meaningful for near-ties only.
+# KEY_PENTA_BIAS_GATE       = 0.03: the gap at which the bias kicks in.
+KEY_PENTATONIC_MINOR_BIAS = 0.01
+KEY_PENTA_BIAS_GATE       = 0.03

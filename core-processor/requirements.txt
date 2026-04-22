@@ -7,6 +7,4 @@ scipy
 av
 demucs
 
-# Future upgrade: swap pitch_extraction.py backend to basic-pitch
-# when Python 3.14 wheels become available:
-# basic-pitch
+basic-pitch

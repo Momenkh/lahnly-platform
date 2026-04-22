@@ -20,14 +20,20 @@ Pipeline stages:
    11  Chord sheet            (PNG chord box diagrams + progression)
 
 Options:
-    --guitar-type T   lead | acoustic | rhythm (default: rhythm)
-                      lead     = electric solo — lower confidence, polyphony 3, min-note 40ms
-                      acoustic = fingerpicked/strummed — middle-ground thresholds
-                      rhythm   = full chords — strictest confidence, polyphony 6
+    --type T      acoustic | clean | distorted  (default: clean)
+                  Tonal character of the guitar.
+                  acoustic   = nylon/steel string — middle-ground thresholds
+                  clean      = clean electric — default electric settings
+                  distorted  = distorted electric — HPSS pre-filter + tighter thresholds
+    --role R      lead | rhythm  (default: rhythm)
+                  Playing style.
+                  lead       = single-note solo — lower polyphony, melody isolation
+                  rhythm     = chords / rhythm parts — full polyphony, all notes used
     --start MM:SS     Only process notes from this time onward
     --end   MM:SS     Only process notes up to this time
     --bpm-override N  Force BPM to N instead of auto-detecting
     --force-tempo     Re-detect BPM even if a saved tempo exists
+    --score           Compute chroma similarity score (stem vs preview) and print it
     --no-play         Skip audio playback (still saves 09_preview.wav)
     --no-viz          Skip fretboard and chord sheet images
     --no-separate     Skip separation (use raw mix for pitch detection)
@@ -45,16 +51,25 @@ from pipeline.config import set_outputs_dir
 def parse_args():
     parser = argparse.ArgumentParser(description="Guitar tab transcription pipeline")
     parser.add_argument("audio_file", nargs="?", help="Path to audio file (WAV, FLAC, M4A, MP3)")
+    parser.add_argument("--score",         action="store_true", help="Compute chroma similarity score (stem vs preview) after processing")
     parser.add_argument("--no-play",      action="store_true", help="Skip audio playback")
     parser.add_argument("--no-viz",       action="store_true", help="Skip visualization")
     parser.add_argument("--no-separate",  action="store_true", help="Skip separation (use raw mix)")
     parser.add_argument("--no-quantize",  action="store_true", help="Skip tempo detection and quantization")
     parser.add_argument("--force-tempo",  action="store_true", help="Re-detect BPM even if saved tempo exists")
     parser.add_argument(
-        "--guitar-type",
-        choices=["lead", "acoustic", "rhythm"],
-        default="rhythm",
-        help="Guitar type: lead (solo/single-note), acoustic, rhythm (default, full chords)",
+        "--type",
+        choices=["acoustic", "clean", "distorted"],
+        default=None,
+        dest="guitar_type",
+        help="Guitar type: acoustic, clean, distorted (default: auto-detected from stem)",
+    )
+    parser.add_argument(
+        "--role",
+        choices=["lead", "rhythm"],
+        default=None,
+        dest="guitar_role",
+        help="Guitar role: lead or rhythm (default: auto-detected from stem)",
     )
     parser.add_argument(
         "--bpm-override",
@@ -140,10 +155,61 @@ def main():
             print("[Stage 1] Skipped — using raw mix for pitch detection")
         pitch_input = args.audio_file
 
+    # ── Auto-detect guitar type + role (when not explicitly specified) ───────
+    if args.guitar_type is None or args.guitar_role is None:
+        from pipeline.separation import get_stem_path
+        from pipeline.auto_detect import detect_guitar_mode
+
+        # Prefer the separated stem for detection (more reliable than raw mix).
+        # Fall back to the raw audio only if the stem doesn't exist.
+        stem_path  = get_stem_path()
+        detect_src = stem_path if os.path.isfile(stem_path) else None
+        if detect_src is None and pitch_input and os.path.isfile(pitch_input):
+            detect_src = pitch_input
+
+        if detect_src and os.path.isfile(detect_src):
+            print(f"[Auto] Detecting guitar type + role from: {os.path.basename(detect_src)}")
+            detected = detect_guitar_mode(detect_src)
+            f = detected["features"]
+            print(f"[Auto] flatness={f['spectral_flatness']}  "
+                  f"contrast={f['spectral_contrast']}  "
+                  f"centroid={f['spectral_centroid_hz']:.0f}Hz  "
+                  f"polyphony={f['median_polyphony']}  "
+                  f"onsets/s={f['onset_density_per_s']}")
+
+            if args.guitar_type is None:
+                args.guitar_type = detected["guitar_type"]
+                conf = detected["type_confidence"]
+                flag = "" if conf >= 0.70 else "  [low confidence — use --type to override]"
+                print(f"[Auto] Type  → {args.guitar_type:<10} ({conf:.0%} confidence){flag}")
+
+            if args.guitar_role is None:
+                args.guitar_role = detected["guitar_role"]
+                conf = detected["role_confidence"]
+                flag = "" if conf >= 0.70 else "  [low confidence — use --role to override]"
+                print(f"[Auto] Role  → {args.guitar_role:<10} ({conf:.0%} confidence){flag}")
+        else:
+            # No audio source for detection — try saved clean meta, then defaults
+            if args.from_stage >= 3:
+                from pipeline.note_cleaning import load_clean_meta
+                meta = load_clean_meta()
+                if args.guitar_type is None:
+                    args.guitar_type = meta.get("guitar_type", "clean")
+                if args.guitar_role is None:
+                    args.guitar_role = meta.get("guitar_role", "rhythm")
+                print(f"[Auto] Using saved mode: type={args.guitar_type} role={args.guitar_role}")
+            else:
+                if args.guitar_type is None:
+                    args.guitar_type = "clean"
+                if args.guitar_role is None:
+                    args.guitar_role = "rhythm"
+                print(f"[Auto] No audio source for detection — defaulting to "
+                      f"type={args.guitar_type} role={args.guitar_role}")
+
     # ── Stage 2: Pitch Extraction ─────────────────────────────────────────────
     if args.from_stage <= 2:
         from pipeline.pitch_extraction import extract_pitches
-        raw_notes = extract_pitches(pitch_input, guitar_type=args.guitar_type)
+        raw_notes = extract_pitches(pitch_input, guitar_type=args.guitar_type, guitar_role=args.guitar_role)
     elif args.from_stage <= 3:
         from pipeline.pitch_extraction import load_raw_notes
         print("[Stage 2] Skipped — loading saved raw notes")
@@ -153,20 +219,21 @@ def main():
     # ── Stage 3: Note Cleaning ────────────────────────────────────────────────
     if args.from_stage <= 3:
         from pipeline.note_cleaning import clean_notes
-        cleaned_notes = clean_notes(raw_notes, guitar_type=args.guitar_type)
+        cleaned_notes = clean_notes(raw_notes, guitar_type=args.guitar_type, guitar_role=args.guitar_role)
     else:
         from pipeline.note_cleaning import load_cleaned_notes, load_clean_meta
         print("[Stage 3] Skipped — loading saved cleaned notes")
         cleaned_notes = load_cleaned_notes()
 
-        # Guitar-type mismatch warning
+        # Mode mismatch warning
         meta = load_clean_meta()
-        saved_type = meta.get("guitar_type")
-        if saved_type and saved_type != args.guitar_type:
-            print(f"[Warning] Saved cleaned notes used --guitar-type={saved_type} "
-                  f"but current run specifies '{args.guitar_type}'.")
+        saved_mode = meta.get("mode")
+        cur_mode   = f"{args.guitar_type}_{args.guitar_role}"
+        if saved_mode and saved_mode != cur_mode:
+            print(f"[Warning] Saved cleaned notes used mode={saved_mode} "
+                  f"but current run specifies '{cur_mode}'.")
             print(f"[Warning] Results may be inconsistent — re-run with --from-stage 3 "
-                  f"to re-clean with '{args.guitar_type}' settings.")
+                  f"to re-clean with '{cur_mode}' settings.")
 
     # ── Stage 4: Tempo Detection & Quantization ───────────────────────────────
     if not args.no_quantize:
@@ -223,7 +290,8 @@ def main():
     # ── Stage 6: Guitar Mapping ───────────────────────────────────────────────
     if args.from_stage <= 6:
         from pipeline.guitar_mapping import map_to_guitar
-        mapped_notes = map_to_guitar(cleaned_notes, key_info=key_info, guitar_type=args.guitar_type)
+        mapped_notes = map_to_guitar(cleaned_notes, key_info=key_info,
+                                     guitar_type=args.guitar_type, guitar_role=args.guitar_role)
     else:
         from pipeline.guitar_mapping import load_mapped_notes
         print("[Stage 6] Skipped — loading saved mapped notes")
@@ -243,23 +311,27 @@ def main():
               f"(removed {before - len(mapped_notes)})")
 
     # ── Melody isolation ──────────────────────────────────────────────────────
-    # For lead guitar, separate the top voice (melody) from harmony notes.
-    # Tabs are generated from melody only; harmony feeds chord detection.
+    # For lead role: isolate the top voice for tabs and audio preview.
+    # For rhythm role: use all mapped notes so chord columns are rendered.
     from pipeline.guitar_mapping import isolate_melody
     from pipeline.settings import MELODY_MIN_PITCH
     melody_notes, harmony_notes = isolate_melody(
         mapped_notes,
-        min_pitch=MELODY_MIN_PITCH.get(args.guitar_type, 0),
+        min_pitch=MELODY_MIN_PITCH.get(args.guitar_role, 0),
     )
 
+    tab_notes   = melody_notes if args.guitar_role == "lead" else mapped_notes
+    audio_notes = melody_notes if args.guitar_role == "lead" else mapped_notes
+
     # ── Stage 7: Chord Detection ──────────────────────────────────────────────
-    # Feed harmony notes (and any chord-like groups from full mapped set) into
-    # chord detection. Using harmony_notes means fast melodic runs don't
-    # accidentally register as chords.
+    # harmony_notes excludes fast single-voice runs so they don't trigger
+    # false chord groups. For lead role this is the melody complement;
+    # for rhythm role pass all mapped notes (harmony_notes ≈ mapped_notes).
+    chord_input = harmony_notes if args.guitar_role == "lead" else mapped_notes
     if args.from_stage <= 7:
         from pipeline.chord_detection import detect_chords
         _, chord_groups = detect_chords(
-            mapped_notes, tempo_info=tempo_info, key_info=key_info
+            chord_input, tempo_info=tempo_info, key_info=key_info
         )
     else:
         from pipeline.chord_detection import load_chord_detection
@@ -270,39 +342,44 @@ def main():
             from pipeline.chord_detection import detect_chords
             print("[Stage 7] No saved chord data — running now")
             _, chord_groups = detect_chords(
-                mapped_notes, tempo_info=tempo_info, key_info=key_info
+                chord_input, tempo_info=tempo_info, key_info=key_info
             )
 
     # ── Stage 8: Tab Generation ───────────────────────────────────────────────
-    # Tabs use melody_notes only — clean single-voice representation
+    # lead: melody only (single-voice); rhythm/acoustic: all mapped notes (chord columns)
     if args.from_stage <= 8:
         from pipeline.tab_generation import generate_tabs
-        tab_str = generate_tabs(melody_notes, chord_groups=chord_groups, tempo_info=tempo_info)
+        tab_str = generate_tabs(tab_notes, chord_groups=chord_groups, tempo_info=tempo_info)
     else:
         from pipeline.tab_generation import load_tabs
         print("[Stage 8] Skipped — loading saved tabs")
         tab_str = load_tabs()
 
-    print("\n" + "=" * 60)
-    bpm_label = f"  |  {tempo_info['bpm']:.1f} BPM" if tempo_info else ""
-    range_label = ""
-    if t_start_s is not None or t_end_s is not None:
-        range_label = f"  |  {args.start or '0:00'}-{args.end or 'end'}"
-    print(f"GUITAR TABS  --  {key_info['key_str']}{bpm_label}{range_label}")
-    print("=" * 60)
-    print(tab_str[:2000])
-    if len(tab_str) > 2000:
-        print("  ... (truncated — see 08_tabs.txt for full tab)")
-    print("=" * 60 + "\n")
-
     # ── Stage 9: Audio Export + Playback ─────────────────────────────────────
     if args.from_stage <= 9:
         from pipeline.audio_playback import save_audio, play_notes
-        save_audio(melody_notes)
+        save_audio(audio_notes)
         if not args.no_play:
-            play_notes(melody_notes)
+            play_notes(audio_notes)
     else:
         print("[Stage 9] Skipped")
+
+    # ── Score: Chroma Similarity ──────────────────────────────────────────────
+    if args.score:
+        from pipeline.evaluation import score_transcription
+        from pipeline.separation import get_stem_path
+        from pipeline.config import get_outputs_dir
+
+        stem_path    = get_stem_path()
+        preview_path = os.path.join(get_outputs_dir(), "09_preview.wav")
+
+        if os.path.isfile(stem_path) and os.path.isfile(preview_path):
+            sim = score_transcription(stem_path, preview_path)
+            print(f"\n[Score] Chroma similarity (stem vs preview): {sim:.3f}"
+                  f"  (0.55 = poor  |  0.70 = usable  |  0.85 = very good)")
+        else:
+            missing = stem_path if not os.path.isfile(stem_path) else preview_path
+            print(f"[Score] Skipped — file not found: {missing}")
 
     # ── Stage 10: Fretboard Visualization ────────────────────────────────────
     if not args.no_viz and args.from_stage <= 10:

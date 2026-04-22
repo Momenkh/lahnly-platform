@@ -3,16 +3,18 @@ Stage 9 — Audio Synthesis
 ==========================
 Settings for the synthesized preview WAV file.
 
-The synthesizer uses additive synthesis: each note is a sum of sinusoidal
-harmonics with an amplitude envelope (attack + sustain + release).  The result
-is a guitar-like pluck sound without requiring a sample library.
+The synthesizer uses Karplus-Strong physical modelling: a delay buffer of
+Gaussian noise is fed through a one-pole lowpass feedback loop, producing
+a realistic plucked-string decay without requiring a sample library.
 
-Harmonic series
----------------
-Guitar tone is dominated by the fundamental and its first few harmonics.
-The second harmonic (one octave up, +12 semitones) adds brightness; the third
-(octave + fifth, +19 semitones) adds warmth.  Higher harmonics contribute
-little perceptible character and are omitted.
+Karplus-Strong basics
+---------------------
+  delay_length = round(sample_rate / frequency)   # one period of the string
+  y[n] = damping × 0.5 × (y[n-P] + y[n-P-1])    # lowpass feedback recurrence
+
+The 0.5 factor implements the one-pole lowpass that bleeds energy faster at
+high frequencies, replicating how a real string's upper partials damp first.
+AUDIO_KS_DAMPING controls the overall decay speed: 1.0 = no decay, 0.99 = fast.
 
 Amplitude scaling
 -----------------
@@ -22,29 +24,17 @@ that also serves as an audio quality indicator.
 """
 
 # Output sample rate.  Must match the rest of the pipeline's audio processing.
-# Do not change unless you also update SEPARATION_SAMPLE_RATE and any
-# downstream playback code.
 AUDIO_SAMPLE_RATE = 44100   # Hz
-
-# ── Additive synthesis harmonics ─────────────────────────────────────────────
-# Amplitude of each harmonic relative to the fundamental (= 1.0).
-# Reduce to 0.0 to remove a harmonic entirely for a purer, flute-like tone.
-AUDIO_HARMONIC_2ND = 0.30   # first overtone (2× fundamental, one octave up)
-AUDIO_HARMONIC_3RD = 0.15   # second overtone (3× fundamental, octave + perfect fifth)
 
 # ── Per-note amplitude ────────────────────────────────────────────────────────
 # amp = AUDIO_AMP_BASE + AUDIO_AMP_CONF_SCALE × confidence
-# At confidence = 1.0: amp = 0.15 + 0.25 = 0.40
-# At confidence = 0.0: amp = 0.15
-# The base ensures even very uncertain notes are audible; the scale adds
-# dynamic contrast.  Keep AMP_BASE + AMP_CONF_SCALE ≤ 0.6 to avoid clipping
-# when multiple notes sound simultaneously.
+# At confidence = 1.0: amp = 0.40; at confidence = 0.0: amp = 0.15
 AUDIO_AMP_BASE       = 0.15
 AUDIO_AMP_CONF_SCALE = 0.25
 
-# ── Amplitude envelope ────────────────────────────────────────────────────────
-# Simulates the pluck transient (attack) and string decay (release).
-# Attack: time in seconds from silence to peak amplitude.
-# Release: time in seconds from note end to silence.
-AUDIO_ATTACK_S  = 0.008   # 8ms — fast pluck-like transient
-AUDIO_RELEASE_S = 0.060   # 60ms — short tail to avoid abrupt cutoffs
+# ── Karplus-Strong damping ────────────────────────────────────────────────────
+# Controls how quickly the plucked string decays.
+# Range: 0.990 (fast decay / short sustain) → 0.999 (slow decay / long sustain)
+# Guitar: 0.996 is a good middle ground for a standard plucked note.
+# Lower for a more percussive / muted sound; raise for a sustain-heavy sound.
+AUDIO_KS_DAMPING = 0.996

@@ -18,16 +18,14 @@ A candidate group must pass three quality gates before it is labelled a chord:
 """
 
 # ── Strum window ──────────────────────────────────────────────────────────────
-# Notes are strummed one string at a time; even a fast strum takes ~30–80ms.
+# Notes are strummed one string at a time; even a fast strum takes ~50–100ms.
 # Notes starting within the strum window are considered part of the same chord.
 #
-# When a BPM is available, the window is derived from the beat duration:
-#   strum_window = min(beat × STRUM_BEAT_FRACTION, CHORD_DEFAULT_STRUM_S)
-# At 120 BPM (beat = 0.5s): window = min(0.5 × 0.20, 0.06) = min(0.10, 0.06) = 0.06s.
-# At 60 BPM  (beat = 1.0s): window = min(1.0 × 0.20, 0.06) = min(0.20, 0.06) = 0.06s.
+# The window is a rolling anchor: each new note resets the group reference to
+# its own start time, so a slow strum (6 strings across 90ms) stays in one group.
 # The cap prevents very slow tempos from creating an absurdly wide grouping window.
-CHORD_DEFAULT_STRUM_S     = 0.06   # fallback strum window when BPM is unknown (seconds)
-CHORD_STRUM_BEAT_FRACTION = 0.20   # strum window as a fraction of one beat
+CHORD_DEFAULT_STRUM_S     = 0.09   # fallback strum window when BPM is unknown (seconds)
+CHORD_STRUM_BEAT_FRACTION = 0.25   # strum window as a fraction of one beat
 
 # ── Chord validity gates ──────────────────────────────────────────────────────
 CHORD_MIN_NOTES      = 3      # minimum simultaneous notes to form a chord

@@ -52,17 +52,19 @@ BP_FRAMES_PER_SEC = BP_SAMPLE_RATE / BP_HOP_LENGTH   # ~86.1 fps
 
 def extract_pitches(
     audio_path: str,
-    guitar_type: str = "rhythm",
+    guitar_type: str = "clean",
+    guitar_role: str = "rhythm",
     save: bool = True,
 ) -> list[dict]:
     """
     Extract notes from audio.
     Loads stem_confidence from Stage 1 metadata to tune thresholds.
-    guitar_type: "lead" | "acoustic" | "rhythm"
+    guitar_type: "acoustic" | "clean" | "distorted"
+    guitar_role: "lead" | "rhythm"
     Returns list of {pitch, start, duration, confidence}.
     """
     try:
-        return _extract_basic_pitch(audio_path, guitar_type=guitar_type, save=save)
+        return _extract_basic_pitch(audio_path, guitar_type=guitar_type, guitar_role=guitar_role, save=save)
     except ImportError as e:
         print(f"[Stage 2] basic-pitch not available ({e}), falling back to pyin")
         return _extract_pyin(audio_path, save=save)
@@ -70,25 +72,40 @@ def extract_pitches(
 
 # ── basic-pitch backend ───────────────────────────────────────────────────────
 
-def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: bool = True) -> list[dict]:
+def _extract_basic_pitch(audio_path: str, guitar_type: str = "clean", guitar_role: str = "rhythm", save: bool = True) -> list[dict]:
     from basic_pitch.inference import run_inference, AUDIO_SAMPLE_RATE, FFT_HOP
     from basic_pitch.inference import infer as bp_infer
     from basic_pitch import ICASSP_2022_MODEL_PATH
-    from pipeline.separation import load_stem_meta
+    from pipeline.separation import load_stem_meta, gate_notes_by_stem_energy
+    from pipeline.settings import PITCH_DISTORTED_HPSS_MARGIN
 
     stem_conf = load_stem_meta().get("stem_confidence", 0.5)
+    mode_key  = f"{guitar_type}_{guitar_role}"
     print(f"[Stage 2] Loading audio: {audio_path}")
-    print(f"[Stage 2] stem_confidence={stem_conf:.2f}  type={guitar_type}")
+    print(f"[Stage 2] stem_confidence={stem_conf:.2f}  mode={mode_key}")
 
-    # Lead guitar uses a higher ceiling to capture bends at the highest frets
-    midi_max = GUITAR_MIDI_MAX_LEAD if guitar_type == "lead" else GUITAR_MIDI_MAX
-    hz_max   = GUITAR_HZ_MAX_LEAD   if guitar_type == "lead" else GUITAR_HZ_MAX
+    # HPSS pre-processing for distorted guitar — isolate harmonic component
+    # before basic-pitch so boosted distortion harmonics don't flood detections.
+    if guitar_type == "distorted":
+        import librosa, tempfile, soundfile as sf
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        y_harmonic, _ = librosa.effects.hpss(y, margin=PITCH_DISTORTED_HPSS_MARGIN)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp.name, y_harmonic, sr)
+        audio_path_for_bp = tmp.name
+        print(f"[Stage 2] Distorted guitar: HPSS applied (harmonic component only)")
+    else:
+        audio_path_for_bp = audio_path
+
+    # Lead role uses a higher ceiling to capture bends at the highest frets
+    midi_max = GUITAR_MIDI_MAX_LEAD if guitar_role == "lead" else GUITAR_MIDI_MAX
+    hz_max   = GUITAR_HZ_MAX_LEAD   if guitar_role == "lead" else GUITAR_HZ_MAX
 
     # Determine pass configurations
-    pass_configs = PITCH_MULTI_PASS_CONFIGS.get(guitar_type)
+    pass_configs = PITCH_MULTI_PASS_CONFIGS.get(mode_key)
     if pass_configs is None:
-        # Single adaptive pass (rhythm)
-        onset, frame, min_ms = _resolve_thresholds(guitar_type, stem_conf)
+        # Single adaptive pass fallback
+        onset, frame, min_ms = _resolve_thresholds(guitar_type, guitar_role, stem_conf)
         pass_configs = [(onset, frame, min_ms)]
 
     n_passes = len(pass_configs)
@@ -96,7 +113,7 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: boo
     # Run model inference ONCE — all passes share the same neural network output.
     # Previously predict() was called N times, re-running the full network each time.
     print(f"[Stage 2] Running model inference...")
-    model_output = run_inference(audio_path, ICASSP_2022_MODEL_PATH)
+    model_output = run_inference(audio_path_for_bp, ICASSP_2022_MODEL_PATH)
     note_arr = model_output.get("note")
 
     all_pass_notes = []    # list[list[dict]]
@@ -107,10 +124,10 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: boo
 
         min_note_len = int(np.round(min_ms / 1000 * (AUDIO_SAMPLE_RATE / FFT_HOP)))
         # melodia_trick suppresses notes it considers harmonically overshadowed by a
-        # stronger neighbour. For lead guitar this kills adjacent-semitone bend notes
-        # (e.g. MIDI 84 and 86 next to a dominant MIDI 85). Disable it for lead so
-        # every detected pitch survives; the multi-pass confidence merge handles quality.
-        melodia = guitar_type != "lead"
+        # stronger neighbour. Designed for monophonic melodies; for guitar chords it
+        # kills chord tones (e.g. G and B in an Em chord are suppressed by the root E).
+        # Disabled for all guitar types — polyphony is handled downstream by the
+        # multi-pass confidence merge and the cleaning polyphony limit.
         midi_data, _ = bp_infer.model_output_to_notes(
             model_output,
             onset_thresh=onset_t,
@@ -118,7 +135,7 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: boo
             min_note_len=min_note_len,
             min_freq=GUITAR_HZ_MIN,
             max_freq=hz_max,
-            melodia_trick=melodia,
+            melodia_trick=False,
         )
 
         pass_notes = []
@@ -148,6 +165,14 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: boo
     total_raw = sum(len(p) for p in all_pass_notes)
     print(f"[Stage 2] Merged {total_raw} notes across {n_passes} pass(es) "
           f"-> {len(notes)} unique notes")
+
+    # Stem energy gate: remove ghost notes from silent stem sections
+    before = len(notes)
+    notes  = gate_notes_by_stem_energy(notes)
+    if before != len(notes):
+        print(f"[Stage 2] Stem energy gate: removed {before - len(notes)} ghost notes "
+              f"from silent stem regions  ({len(notes)} remaining)")
+
     _save_pass_preview(notes, "merged_raw")
 
     if save:
@@ -155,9 +180,10 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "rhythm", save: boo
     return notes
 
 
-def _resolve_thresholds(guitar_type: str, stem_conf: float) -> tuple[float, float, int]:
-    """Return (onset_threshold, frame_threshold, min_note_ms) for the given type."""
-    row = PITCH_THRESHOLDS.get(guitar_type, PITCH_THRESHOLDS["rhythm"])
+def _resolve_thresholds(guitar_type: str, guitar_role: str, stem_conf: float) -> tuple[float, float, int]:
+    """Return (onset_threshold, frame_threshold, min_note_ms) for the given type+role."""
+    mode_key = f"{guitar_type}_{guitar_role}"
+    row = PITCH_THRESHOLDS.get(mode_key, PITCH_THRESHOLDS["clean_rhythm"])
     onset, frame, min_ms = row
 
     if onset is None:
@@ -165,7 +191,7 @@ def _resolve_thresholds(guitar_type: str, stem_conf: float) -> tuple[float, floa
         if guitar_type == "acoustic":
             onset = round(PITCH_ACOUSTIC_ONSET_BASE - stem_conf * PITCH_ACOUSTIC_ONSET_SCALE, 2)
             frame = round(PITCH_ACOUSTIC_FRAME_BASE - stem_conf * PITCH_ACOUSTIC_FRAME_SCALE, 2)
-        else:  # rhythm (and any unknown type)
+        else:  # clean / distorted rhythm (and any unknown type)
             onset = round(PITCH_RHYTHM_ONSET_BASE - stem_conf * PITCH_RHYTHM_ONSET_SCALE, 2)
             frame = round(PITCH_RHYTHM_FRAME_BASE - stem_conf * PITCH_RHYTHM_FRAME_SCALE, 2)
 
@@ -222,14 +248,14 @@ def _correct_octave_errors(notes: list[dict]) -> list[dict]:
             continue
 
         p = note["pitch"]
-        min_dist = min(abs(p - nb) % 12 for nb in neighbours)
+        min_dist = min(abs(p - nb) for nb in neighbours)
 
         if min_dist > 5:
             for shift in (12, -12):
                 shifted = p + shift
                 if not (GUITAR_MIDI_MIN <= shifted <= GUITAR_MIDI_MAX):
                     continue
-                shifted_dist = min(abs(shifted - nb) % 12 for nb in neighbours)
+                shifted_dist = min(abs(shifted - nb) for nb in neighbours)
                 if shifted_dist < min_dist:
                     corrected[i] = dict(note, pitch=shifted)
                     break

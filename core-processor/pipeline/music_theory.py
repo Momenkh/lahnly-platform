@@ -18,9 +18,25 @@ import os
 import numpy as np
 
 from pipeline.config import get_outputs_dir
-from pipeline.settings import KEY_PENTATONIC_MINOR_BIAS
+from pipeline.settings import KEY_PENTATONIC_MINOR_BIAS, KEY_PENTA_BIAS_GATE
 
-CHROMATIC = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+CHROMATIC      = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+CHROMATIC_FLAT = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+
+# Keys whose key signature uses flats rather than sharps.
+# Enharmonic equivalents (e.g. F#/Gb major) are assigned to the flat side.
+_FLAT_MAJOR_ROOTS = frozenset({1, 3, 5, 6, 8, 10})   # Db Eb F Gb Ab Bb
+_FLAT_MINOR_ROOTS = frozenset({0, 2, 3, 5, 7, 10})   # C  D  Eb F  G  Bb
+
+
+def key_uses_flats(root: int, mode: str) -> bool:
+    """Return True when the key signature for (root, mode) uses flat accidentals."""
+    return root in (_FLAT_MAJOR_ROOTS if mode == "major" else _FLAT_MINOR_ROOTS)
+
+
+def note_name(pitch_class: int, use_flats: bool) -> str:
+    """Return the canonical note name for a pitch class given the key context."""
+    return (CHROMATIC_FLAT if use_flats else CHROMATIC)[pitch_class % 12]
 
 KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
                      2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -57,7 +73,8 @@ def analyze_key(cleaned_notes: list[dict], save: bool = True) -> dict:
     scale_name = _best_scale(histogram, root, mode)
     scale_pcs  = _scale_pitch_classes(root, scale_name)
 
-    root_name  = CHROMATIC[root]
+    use_flats  = key_uses_flats(root, mode)
+    root_name  = note_name(root, use_flats)
     mode_label = "major" if mode == "major" else "minor"
     penta_label = " (pentatonic)" if "pentatonic" in scale_name else \
                   " (blues)"      if scale_name == "blues" else ""
@@ -67,6 +84,7 @@ def analyze_key(cleaned_notes: list[dict], save: bool = True) -> dict:
         "root":       root_name,
         "root_midi":  root,
         "mode":       mode,
+        "use_flats":  use_flats,
         "scale":      scale_name,
         "scale_pcs":  scale_pcs,
         "key_str":    key_str,
@@ -131,8 +149,8 @@ def _detect_key(histogram: np.ndarray) -> tuple[int, str, float, list[dict]]:
 
     candidates = []
     for r, root, mode in scores[:5]:
-        rn      = CHROMATIC[root]
-        ml      = "major" if mode == "major" else "minor"
+        rn = note_name(root, key_uses_flats(root, mode))
+        ml = "major" if mode == "major" else "minor"
         candidates.append({"key_str": f"{rn} {ml}", "confidence": round(r, 4)})
 
     return best_root, best_mode, best_r, candidates
@@ -147,19 +165,22 @@ def _best_scale(histogram: np.ndarray, root: int, mode: str) -> str:
         if parent == parent_key
     ] + [diatonic]
 
-    best_score = -1.0
-    best_name  = diatonic
-
+    # First pass: raw scores (no bias)
+    raw_scores: dict[str, float] = {}
     for name in candidates:
-        pcs   = set(_scale_pitch_classes(root, name))
-        score = sum(histogram[pc] for pc in pcs)
-        # Guitar-specific bias for pentatonic minor
-        if name == "pentatonic_minor":
-            score += KEY_PENTATONIC_MINOR_BIAS
-        if score > best_score:
-            best_score = score
-            best_name  = name
+        pcs = set(_scale_pitch_classes(root, name))
+        raw_scores[name] = sum(histogram[pc] for pc in pcs)
 
+    best_raw   = max(raw_scores.values())
+    penta_score = raw_scores.get("pentatonic_minor", -1.0)
+
+    # Apply bias only when the gap between first and second is small enough
+    # that pentatonic minor is a genuine contender (not an obvious wrong choice).
+    scores = dict(raw_scores)
+    if "pentatonic_minor" in scores and (best_raw - penta_score) <= KEY_PENTA_BIAS_GATE:
+        scores["pentatonic_minor"] += KEY_PENTATONIC_MINOR_BIAS
+
+    best_name = max(scores, key=lambda n: scores[n])
     return best_name
 
 

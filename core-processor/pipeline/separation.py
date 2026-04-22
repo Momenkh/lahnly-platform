@@ -15,11 +15,11 @@ Quality improvements:
   - stem_confidence score saved to stem_meta and used by downstream stages
   - overlap=0.5 reduces stitching artifacts at chunk boundaries
   - shifts=1 averages two passes for cleaner output
-  - Confidence-weighted blend with original mix:
+  - Optional raw mix blending (controlled by SEPARATION_MIX_WITH_RAW in settings):
       final = alpha * stem + (1 - alpha) * original   (alpha = stem_confidence)
-    When confidence is low, Demucs strips transients and high harmonics. Blending
-    back the original recovers attack and brightness that basic-pitch relies on for
-    onset detection — at the cost of some bleed from other instruments.
+    Disabled by default. When enabled and confidence is low, blending back the
+    original recovers transients and brightness that Demucs strips — at the cost
+    of bleed from other instruments.
 """
 
 import json
@@ -35,6 +35,9 @@ from pipeline.settings import (
     SEPARATION_TARGET_LUFS,
     SEPARATION_MODELS,
     SEPARATION_MODEL_BASE_CONF,
+    SEPARATION_MIX_WITH_RAW,
+    SEPARATION_MAX_RAW_BLEND,
+    SEPARATION_BLEND_GATE_WINDOW,
 )
 
 
@@ -117,19 +120,30 @@ def separate_guitar(audio_path: str, save: bool = True) -> str:
 
     print(f"[Stage 1] stem_confidence: {stem_confidence:.3f}")
 
-    # ── Confidence-weighted blend with original mix ───────────────────────────
-    # High confidence → mostly stem (clean separation)
-    # Low confidence  → lean on original (recover transients / brightness)
-    alpha = stem_confidence
-    mix_waveform = waveform.to(guitar_stem.device)
+    # ── Optional confidence-weighted blend with original mix ─────────────────
+    if SEPARATION_MIX_WITH_RAW:
+        mix_waveform = waveform.to(guitar_stem.device)
+        min_len      = min(guitar_stem.shape[-1], mix_waveform.shape[-1])
+        guitar_stem  = guitar_stem[..., :min_len]
+        mix_waveform = mix_waveform[..., :min_len]
 
-    # Align lengths (stem may be slightly shorter/longer than mix due to padding)
-    min_len = min(guitar_stem.shape[-1], mix_waveform.shape[-1])
-    guitar_stem  = guitar_stem[..., :min_len]
-    mix_waveform = mix_waveform[..., :min_len]
+        stem_weight = stem_confidence
+        raw_weight  = SEPARATION_MAX_RAW_BLEND * (1.0 - stem_confidence)
 
-    blended = alpha * guitar_stem + (1.0 - alpha) * mix_waveform
-    print(f"[Stage 1] Blended: {alpha:.2f} x stem + {1-alpha:.2f} x original mix")
+        # Energy gate: raw bleed is multiplied by 0 wherever the stem is silent.
+        # Prevents raw mix from leaking into intros, outros, or any section
+        # where the target instrument isn't playing.
+        gate    = _stem_activity_gate(guitar_stem, SEPARATION_BLEND_GATE_WINDOW,
+                                      SEPARATION_RMS_SILENCE_THRESH)
+        blended = stem_weight * guitar_stem + raw_weight * gate * mix_waveform
+
+        active_pct = gate.mean().item() * 100
+        print(f"[Stage 1] Blended: {stem_weight:.2f} x stem "
+              f"+ {raw_weight:.2f} x gate x raw  "
+              f"(gate open {active_pct:.0f}% of audio)")
+    else:
+        blended = guitar_stem
+        print("[Stage 1] Using stem only (SEPARATION_MIX_WITH_RAW=False)")
 
     os.makedirs(get_outputs_dir(), exist_ok=True)
     out_path = os.path.join(get_outputs_dir(), "01_guitar_stem.wav")
@@ -150,7 +164,9 @@ def separate_guitar(audio_path: str, save: bool = True) -> str:
             "model":            used_model,
             "stem":             used_stem,
             "stem_confidence":  stem_confidence,
-            "blend_alpha":      round(alpha, 3),
+            "mix_with_raw":     SEPARATION_MIX_WITH_RAW,
+            "stem_weight":      round(stem_weight if SEPARATION_MIX_WITH_RAW else 1.0, 3),
+            "raw_weight":       round(raw_weight  if SEPARATION_MIX_WITH_RAW else 0.0, 3),
             "duration_s":       round(duration_s, 2),
         }
         meta_path = os.path.join(get_outputs_dir(), "01_stem_meta.json")
@@ -173,6 +189,89 @@ def load_stem_meta() -> dict:
 
 def get_stem_path() -> str:
     return os.path.join(get_outputs_dir(), "01_guitar_stem.wav")
+
+
+def gate_notes_by_stem_energy(
+    notes: list,
+    window_s: float = 0.08,
+    thresh: float = 0.005,
+) -> list:
+    """
+    Remove notes that fall entirely within silent windows of the saved stem.
+
+    Loads 01_guitar_stem.wav, divides it into windows of `window_s` seconds,
+    and computes the RMS of each window.  A note is dropped only when every
+    window it overlaps is below `thresh`.  Any overlap with an active window
+    keeps the note.  Fails open (returns all notes) if the stem file is missing.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    stem_path = get_stem_path()
+    if not os.path.isfile(stem_path):
+        return notes
+
+    try:
+        audio, sr = sf.read(stem_path, always_2d=True)
+    except Exception:
+        return notes
+
+    mono        = audio.mean(axis=1).astype(np.float32)
+    win_samples = max(1, int(window_s * sr))
+    n_samples   = len(mono)
+    n_windows   = (n_samples + win_samples - 1) // win_samples
+
+    padded = np.zeros(n_windows * win_samples, dtype=np.float32)
+    padded[:n_samples] = mono
+    chunks     = padded.reshape(n_windows, win_samples)
+    window_rms = np.sqrt((chunks ** 2).mean(axis=1))
+
+    def _is_active(start_s: float, end_s: float) -> bool:
+        lo = max(0, int(start_s / window_s))
+        hi = min(n_windows, int(end_s / window_s) + 1)
+        return bool(np.any(window_rms[lo:hi] > thresh))
+
+    return [n for n in notes if _is_active(n["start"], n["start"] + n["duration"])]
+
+
+# ── Stem activity gate (waveform-level, used during separation) ───────────────
+
+def _stem_activity_gate(stem, window: int, threshold: float):
+    """
+    Returns a per-sample gate tensor in [0, 1] shaped (1, n_samples).
+
+    Gate is 1 where the stem RMS exceeds `threshold` and 0 where it is silent.
+    A short box-filter fade smooths the transitions to avoid clicks.
+    Multiply raw bleed by this gate so it only appears where the instrument
+    is actually playing.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    stem_mono = stem.mean(dim=0)       # (n_samples,)
+    n_samples = stem_mono.shape[0]
+
+    # Pad so length is divisible by window, then compute per-window RMS
+    pad_len    = (-n_samples) % window
+    padded     = F.pad(stem_mono, (0, pad_len))
+    chunks     = padded.reshape(-1, window)        # (n_windows, window)
+    window_rms = chunks.pow(2).mean(-1).sqrt()     # (n_windows,)
+
+    # Binary gate per window → expand to per sample
+    gate = (window_rms > threshold).float()
+    gate = gate.repeat_interleave(window)[:n_samples]   # (n_samples,)
+
+    # Smooth transitions with a short box filter to prevent hard clicks
+    fade = max(2, window // 2)
+    gate = F.avg_pool1d(
+        gate.view(1, 1, -1),
+        kernel_size=fade,
+        stride=1,
+        padding=fade // 2,
+        count_include_pad=False,
+    ).clamp(0.0, 1.0).view(-1)[:n_samples]
+
+    return gate.unsqueeze(0)   # (1, n_samples) — broadcasts over channels
 
 
 # ── Audio loading ─────────────────────────────────────────────────────────────

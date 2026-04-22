@@ -7,7 +7,7 @@ Filters applied in order:
   1. Duration filter      — drop notes shorter than min_duration (type-dependent)
   2. Confidence filter    — drop notes below adaptive threshold (scales with stem quality
                             AND guitar type — lead solos rate lower confidence than chords)
-  3. Bass filter          — stricter confidence gate for notes below E3 (MIDI 52)
+  3. Bass filter          — stricter confidence gate for notes below C2 (MIDI 36)
                             (relaxed when htdemucs_6s dedicated guitar stem was used)
   4. Bend detection       — consecutive notes within 2 semitones over a short gap are
                             merged into one note at the lower pitch (guitar bends/vibrato)
@@ -57,6 +57,9 @@ from pipeline.settings import (
     CLEANING_OCTAVE_SHIFT_THRESHOLD,
     CLEANING_HIGH_PITCH_FLOOR,
     CLEANING_HIGH_PITCH_CONF_REDUCTION,
+    CLEANING_STEM_GATE_ENABLED,
+    CLEANING_STEM_GATE_WINDOW,
+    CLEANING_STEM_GATE_THRESH,
 )
 
 VALID_GUITAR_TYPES = list(CLEANING_TYPE_PARAMS.keys())
@@ -64,22 +67,25 @@ VALID_GUITAR_TYPES = list(CLEANING_TYPE_PARAMS.keys())
 
 def clean_notes(
     raw_notes: list[dict],
-    guitar_type: str = "rhythm",
+    guitar_type: str = "clean",
+    guitar_role: str = "rhythm",
     save: bool = True,
 ) -> list[dict]:
     """
     Clean raw pitch-detection output into stable, distinct notes.
     Loads stem_confidence and tempo_info from prior stages to tune thresholds.
 
-    guitar_type: "lead" | "acoustic" | "rhythm"
+    guitar_type: "acoustic" | "clean" | "distorted"
+    guitar_role: "lead" | "rhythm"
     """
     from pipeline.separation import load_stem_meta
 
-    if guitar_type not in CLEANING_TYPE_PARAMS:
-        print(f"[Stage 3] Unknown guitar_type '{guitar_type}' — defaulting to 'rhythm'")
-        guitar_type = "rhythm"
+    mode_key = f"{guitar_type}_{guitar_role}"
+    if mode_key not in CLEANING_TYPE_PARAMS:
+        print(f"[Stage 3] Unknown mode '{mode_key}' — defaulting to 'clean_rhythm'")
+        mode_key = "clean_rhythm"
 
-    min_dur_fallback, conf_floor, conf_stem_scale, max_poly, bpm_subdiv, merge_ratio = CLEANING_TYPE_PARAMS[guitar_type]
+    min_dur_fallback, conf_floor, conf_stem_scale, max_poly, bpm_subdiv, merge_ratio = CLEANING_TYPE_PARAMS[mode_key]
 
     stem_meta  = load_stem_meta()
     stem_conf  = stem_meta.get("stem_confidence", 0.5)
@@ -113,13 +119,23 @@ def clean_notes(
     else:
         min_dur = min_dur_fallback
 
-    print(f"[Stage 3] Cleaning {len(raw_notes)} raw notes  (type: {guitar_type})")
+    print(f"[Stage 3] Cleaning {len(raw_notes)} raw notes  (mode: {mode_key})")
     print(f"[Stage 3] stem_conf={stem_conf:.2f}  conf_thresh={conf_thresh}  "
           f"bass_conf={bass_conf_thresh}  merge_gap={merge_gap*1000:.0f}ms  "
           f"max_poly={max_poly}  min_dur={min_dur*1000:.0f}ms"
           + (f"  bpm={bpm:.1f}" if bpm else "  bpm=unknown"))
 
     notes = list(raw_notes)
+
+    # 0. Stem energy gate — drop notes in provably silent stem regions
+    #    (also applied in Stage 2; repeated here to cover --from-stage 3 runs)
+    if CLEANING_STEM_GATE_ENABLED:
+        from pipeline.separation import gate_notes_by_stem_energy
+        before = len(notes)
+        notes  = gate_notes_by_stem_energy(notes,
+                                           window_s=CLEANING_STEM_GATE_WINDOW,
+                                           thresh=CLEANING_STEM_GATE_THRESH)
+        print(f"[Stage 3] After stem energy gate   : {len(notes):4d}  (removed {before - len(notes)})")
 
     # 1. Duration filter
     before = len(notes)
@@ -145,8 +161,8 @@ def clean_notes(
     print(f"[Stage 3] After bass filter        : {len(notes):4d}  (removed {before - len(notes)})")
 
     # 4. Bend detection — merge semitone-adjacent consecutive notes
-    #    Only applied for lead/acoustic; rhythm guitar rarely bends single notes
-    if guitar_type in ("lead", "acoustic"):
+    #    Only applied for lead role or acoustic type; rhythm chords rarely bend
+    if guitar_role == "lead" or guitar_type == "acoustic":
         before = len(notes)
         notes  = _merge_bends(notes,
                                max_semitones=CLEANING_BEND_MAX_SEMITONES,
@@ -159,7 +175,7 @@ def clean_notes(
     print(f"[Stage 3] After merging nearby     : {len(notes):4d}  (merged  {before - len(notes)})")
 
     # 5b. Local pitch context filter
-    local_max_dev = CLEANING_LOCAL_PITCH_MAX_DEV.get(guitar_type)
+    local_max_dev = CLEANING_LOCAL_PITCH_MAX_DEV.get(mode_key)
     if local_max_dev is not None:
         before = len(notes)
         notes  = _local_pitch_filter(
@@ -187,10 +203,11 @@ def clean_notes(
             json.dump(notes, f, indent=2)
         print(f"[Stage 3] Saved -> {out_path}")
 
-        # Save guitar_type used so re-runs can detect mismatches
+        # Save mode used so re-runs can detect mismatches
         meta_path = os.path.join(get_outputs_dir(), "03_clean_meta.json")
         with open(meta_path, "w") as f:
-            json.dump({"guitar_type": guitar_type, "conf_thresh": conf_thresh,
+            json.dump({"guitar_type": guitar_type, "guitar_role": guitar_role,
+                       "mode": mode_key, "conf_thresh": conf_thresh,
                        "max_poly": max_poly}, f, indent=2)
 
     return notes

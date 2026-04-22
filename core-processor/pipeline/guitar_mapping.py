@@ -69,7 +69,8 @@ STRING_PREF = {4: 0, 3: 1, 5: 2, 2: 3, 6: 4, 1: 5}
 def map_to_guitar(
     cleaned_notes: list[dict],
     key_info: dict | None = None,
-    guitar_type: str = "rhythm",
+    guitar_type: str = "clean",
+    guitar_role: str = "rhythm",
     save: bool = True,
 ) -> list[dict]:
     if key_info:
@@ -78,7 +79,7 @@ def map_to_guitar(
     else:
         print(f"[Stage 6] Mapping {len(cleaned_notes)} notes")
 
-    bend_tol  = MAPPING_BEND_TOLERANCE_LEAD if guitar_type == "lead" else MAPPING_BEND_TOLERANCE
+    bend_tol  = MAPPING_BEND_TOLERANCE_LEAD if guitar_role == "lead" else MAPPING_BEND_TOLERANCE
     scale_pcs = set(key_info["scale_pcs"]) if key_info else set()
     notes_sorted = sorted(cleaned_notes, key=lambda n: n["start"])
 

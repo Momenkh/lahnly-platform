@@ -30,7 +30,8 @@ from pipeline.settings import (
     CHORD_POWER_INTERVALS,
 )
 
-CHROMATIC = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+CHROMATIC      = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+CHROMATIC_FLAT = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
 
 CHORD_TEMPLATES = {
     "maj":      [0, 4, 7],
@@ -71,6 +72,7 @@ def detect_chords(
         strum_s = CHORD_DEFAULT_STRUM_S
 
     scale_pcs = set(key_info["scale_pcs"]) if key_info else set()
+    use_flats = bool(key_info.get("use_flats", False)) if key_info else False
 
     print(f"[Stage 7] Detecting chords in {len(mapped_notes)} mapped notes "
           f"(strum window: {strum_s*1000:.0f}ms)...")
@@ -103,7 +105,7 @@ def detect_chords(
         if is_chord:
             t_start = min(n["start"] for n in group)
             t_end   = max(n["start"] + n["duration"] for n in group)
-            name    = _name_chord(unique_pcs, scale_pcs)
+            name    = _name_chord(unique_pcs, scale_pcs, use_flats)
             chord_groups.append({
                 "notes":      group,
                 "chord_name": name,
@@ -137,34 +139,43 @@ def load_chord_detection() -> tuple[list[dict], list[dict]]:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _group_simultaneous(sorted_notes: list[dict], strum_s: float) -> list[list[dict]]:
-    """Group notes that start within strum_s of each other."""
+    """
+    Group notes that start within strum_s of each other.
+
+    Rolling anchor: the window reference updates to each new note added to the
+    group, so a slow strum (e.g. 6 strings across 90ms) stays in one group even
+    when consecutive inter-note gaps are each small but cumulative gap is wide.
+    """
     if not sorted_notes:
         return []
 
     groups = []
     current_group = [sorted_notes[0]]
-    group_start   = sorted_notes[0]["start"]
+    last_start    = sorted_notes[0]["start"]
 
     for note in sorted_notes[1:]:
-        if note["start"] - group_start <= strum_s:
+        if note["start"] - last_start <= strum_s:
             current_group.append(note)
+            last_start = note["start"]   # rolling anchor
         else:
             groups.append(current_group)
             current_group = [note]
-            group_start   = note["start"]
+            last_start    = note["start"]
 
     groups.append(current_group)
     return groups
 
 
-def _name_chord(pcs: set, scale_pcs: set) -> str:
+def _name_chord(pcs: set, scale_pcs: set, use_flats: bool = False) -> str:
     """
     Name a chord from its pitch class set.
     - 2 unique PCs: detect power chord, 3rd, etc.
     - 3+ unique PCs: template matching with penalty for extras.
     Key-aware tie-breaking: prefer root+quality diatonic to the key.
-    Returns e.g. "Am", "G7", "D#5", or "?" if nothing fits.
+    Returns e.g. "Am", "G7", "Eb5", "Db", or "?" if nothing fits.
     """
+    names = CHROMATIC_FLAT if use_flats else CHROMATIC
+
     if len(pcs) == 2:
         pc_list  = sorted(pcs)
         lo, hi   = pc_list
@@ -181,8 +192,8 @@ def _name_chord(pcs: set, scale_pcs: set) -> str:
             suffix, root_idx = INTERVAL_MAP[interval]
             root = pc_list[root_idx]
             label = "min" if suffix == "min" else suffix
-            name = CHROMATIC[root] + label
-            return name if suffix else CHROMATIC[root]
+            name = names[root] + label
+            return name if suffix else names[root]
         return "?"
 
     # 3+ pitch classes — try all roots and templates
@@ -199,7 +210,7 @@ def _name_chord(pcs: set, scale_pcs: set) -> str:
                 continue
             score = matches - CHORD_EXTRA_PC_PENALTY * extras
 
-            root_name  = CHROMATIC[root]
+            root_name  = names[root]
             chord_name = root_name if quality == "maj" else f"{root_name}{quality}"
 
             # Key-aware tie-breaking
