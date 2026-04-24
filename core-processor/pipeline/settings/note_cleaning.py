@@ -78,11 +78,11 @@ CLEANING_BEND_MAX_GAP_S     = 0.12 # maximum gap between the two notes (seconds)
 #   merge_ratio      — ratio threshold for the secondary merge condition.
 CLEANING_TYPE_PARAMS = {
     #                       min_dur  conf_floor  stem_scale  max_poly  bpm_subdiv  merge
-    "acoustic_lead":    (0.040,   0.15,       0.25,       2,        12,         0.20),
+    "acoustic_lead":    (0.040,   0.15,       0.25,       3,        12,         0.20),
     "acoustic_rhythm":  (0.080,   0.18,       0.30,       5,         8,         0.15),
-    "clean_lead":       (0.040,   0.10,       0.16,       2,        12,         0.25),
+    "clean_lead":       (0.040,   0.10,       0.16,       3,        12,         0.25),   # 3 allows double-stops and grace-note bends
     "clean_rhythm":     (0.100,   0.17,       0.40,       6,         6,         0.10),
-    "distorted_lead":   (0.040,   0.12,       0.20,       2,        12,         0.25),   # tighter conf: HPSS + distortion still noisy
+    "distorted_lead":   (0.040,   0.12,       0.20,       3,        12,         0.25),   # tighter conf: HPSS + distortion still noisy
     "distorted_rhythm": (0.100,   0.20,       0.45,       6,         6,         0.10),   # tighter conf: distortion raises harmonic floor
 }
 

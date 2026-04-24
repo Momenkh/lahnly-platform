@@ -93,7 +93,10 @@ def synthesize_notes(notes: list[dict]) -> np.ndarray:
         freq = midi_to_hz(note["pitch"])
         dur  = note["duration"]
         conf = float(note.get("confidence", 0.5))
-        amp  = AUDIO_AMP_BASE + AUDIO_AMP_CONF_SCALE * conf
+        # Use a narrow amplitude range so all detected notes contribute equally
+        # to the chroma comparison regardless of confidence.  The buffer is
+        # peak-normalised after synthesis, so only relative amplitudes matter.
+        amp  = AUDIO_AMP_BASE + AUDIO_AMP_CONF_SCALE * max(conf, 0.75)
 
         wave = _karplus_strong(freq, dur, amp, AUDIO_SAMPLE_RATE)
         if len(wave) == 0:

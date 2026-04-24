@@ -253,6 +253,12 @@ def main():
                   f"to re-clean with '{cur_mode}' settings.")
 
     # ── Stage 4: Tempo Detection & Quantization ───────────────────────────────
+    # Save pre-quantization notes for synthesis — quantization snaps timing to a
+    # BPM grid which can drift when the original recording has rubato or unstable
+    # tempo.  The synthesized preview uses the original timing so its chroma
+    # matches the stem more accurately; tabs use the quantized timing.
+    pre_quant_notes = list(cleaned_notes)
+
     if not args.no_quantize:
         from pipeline.quantization import quantize_notes
 
@@ -301,8 +307,15 @@ def main():
 
     # ── Stage 5b: Key-context feedback (octave correction + confidence filter) ──
     from pipeline.note_cleaning import apply_key_octave_correction, apply_key_confidence_filter
+    from pipeline.settings import CLEANING_KEY_CONFIDENCE_CUTOFF
     cleaned_notes = apply_key_octave_correction(cleaned_notes, key_info)
-    cleaned_notes = apply_key_confidence_filter(cleaned_notes, key_info, conf_cutoff=0.35)
+    cleaned_notes = apply_key_confidence_filter(cleaned_notes, key_info,
+                                                conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF)
+    # Apply the same corrections to the pre-quantization copy so the audio
+    # synthesis path gets accurate pitch and the same note set.
+    pre_quant_notes = apply_key_octave_correction(pre_quant_notes, key_info)
+    pre_quant_notes = apply_key_confidence_filter(pre_quant_notes, key_info,
+                                                  conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF)
 
     # ── Stage 6: Guitar Mapping ───────────────────────────────────────────────
     if args.from_stage <= 6:
@@ -330,15 +343,24 @@ def main():
     # ── Melody isolation ──────────────────────────────────────────────────────
     # For lead role: isolate the top voice for tabs and audio preview.
     # For rhythm role: use all mapped notes so chord columns are rendered.
-    from pipeline.guitar_mapping import isolate_melody
+    from pipeline.guitar_mapping import isolate_melody, map_to_guitar as _map
     from pipeline.settings import MELODY_MIN_PITCH
     melody_notes, harmony_notes = isolate_melody(
         mapped_notes,
         min_pitch=MELODY_MIN_PITCH.get(args.guitar_role, 0),
     )
 
-    tab_notes   = melody_notes if args.guitar_role == "lead" else mapped_notes
-    audio_notes = melody_notes if args.guitar_role == "lead" else mapped_notes
+    tab_notes = melody_notes if args.guitar_role == "lead" else mapped_notes
+
+    # Audio synthesis uses pre-quantization timing so the chroma matches the stem
+    # without grid-snapping drift.  Key context (key_info) is still applied via
+    # the 5b filters already run on pre_quant_notes.
+    audio_mapped = _map(pre_quant_notes, key_info=key_info,
+                        guitar_type=args.guitar_type, guitar_role=args.guitar_role,
+                        save=False)
+    audio_melody, _ = isolate_melody(audio_mapped,
+                                     min_pitch=MELODY_MIN_PITCH.get(args.guitar_role, 0))
+    audio_notes = audio_melody if args.guitar_role == "lead" else audio_mapped
 
     # ── Stage 7: Chord Detection ──────────────────────────────────────────────
     # harmony_notes excludes fast single-voice runs so they don't trigger
