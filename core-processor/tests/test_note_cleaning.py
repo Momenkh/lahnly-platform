@@ -14,7 +14,16 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
-from pipeline.note_cleaning import clean_notes, MIN_DURATION_S, CONFIDENCE_THRESHOLD, MERGE_GAP_S, MAX_POLYPHONY, _limit_polyphony
+from pipeline.instruments.guitar.cleaning import clean_notes, _limit_polyphony
+from pipeline.settings import CLEANING_TYPE_PARAMS, CLEANING_DEFAULT_MERGE_GAP_S
+
+# Pull thresholds from the default guitar mode so tests stay in sync with settings.
+_DEFAULT_MODE   = "clean_lead"
+_PARAMS         = CLEANING_TYPE_PARAMS[_DEFAULT_MODE]
+MIN_DURATION_S      = _PARAMS[0]
+CONFIDENCE_THRESHOLD = _PARAMS[1]   # conf_floor (minimum confidence before stem scaling)
+MERGE_GAP_S         = CLEANING_DEFAULT_MERGE_GAP_S
+MAX_POLYPHONY       = _PARAMS[4]
 
 
 def make_note(pitch=60, start=0.0, duration=0.5, confidence=0.9):
@@ -30,7 +39,7 @@ class TestDurationFilter(unittest.TestCase):
 
     def test_exact_min_duration_kept(self):
         notes = [make_note(duration=MIN_DURATION_S)]
-        result = clean_notes(notes, save=False)
+        result = clean_notes(notes, guitar_type="clean", guitar_role="lead", save=False)
         self.assertEqual(len(result), 1)
 
     def test_long_note_kept(self):
@@ -47,8 +56,11 @@ class TestConfidenceFilter(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_exact_threshold_kept(self):
-        notes = [make_note(confidence=CONFIDENCE_THRESHOLD)]
-        result = clean_notes(notes, save=False)
+        # conf_floor is the threshold with a perfect stem (stem_conf=1.0); in tests
+        # stem_conf defaults to 0.5, so the effective threshold is conf_floor + 0.5*scale.
+        # Use a value reliably above the adaptive threshold for clean_lead (max=0.26).
+        notes = [make_note(confidence=CONFIDENCE_THRESHOLD + 0.2)]
+        result = clean_notes(notes, guitar_type="clean", guitar_role="lead", save=False)
         self.assertEqual(len(result), 1)
 
 
@@ -146,12 +158,8 @@ class TestPolyphonyLimit(unittest.TestCase):
         result = _limit_polyphony(notes, max_poly=1)
         self.assertEqual(len(result), 10)
 
-    def test_disabled_when_zero(self):
-        """MAX_POLYPHONY=0 means polyphony filter is skipped in clean_notes."""
-        import pipeline.note_cleaning as nc
-        original = nc.MAX_POLYPHONY
-        nc.MAX_POLYPHONY = 0
-        notes = [self._make(60 + i, 0.0, 1.0, 0.9) for i in range(10)]
-        result = nc.clean_notes(notes, save=False)
-        nc.MAX_POLYPHONY = original
-        self.assertGreater(len(result), 0)
+    def test_high_polyphony_limit_keeps_all(self):
+        """With a very high polyphony limit, all notes survive."""
+        notes = [self._make(60 + i, 0.0, 1.0, 0.9) for i in range(4)]
+        result = _limit_polyphony(notes, max_poly=100)
+        self.assertEqual(len(result), 4)

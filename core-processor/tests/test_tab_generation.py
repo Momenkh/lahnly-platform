@@ -16,8 +16,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
-from pipeline.tab_generation import generate_tabs, STRING_NAMES
-from pipeline.guitar_mapping import MAX_FRET
+from pipeline.instruments.guitar.tab import generate_tabs, STRING_NAMES
+from pipeline.settings import MAPPING_MAX_FRET as MAX_FRET
 
 
 def make_mapped(string, fret, start, duration=0.5):
@@ -29,7 +29,7 @@ def get_string_lines(tab: str) -> list[str]:
     lines = []
     for line in tab.strip().split("\n"):
         stripped = line.strip()
-        if len(stripped) >= 2 and stripped[1] == " " and stripped[0] in "eBGDAe":
+        if len(stripped) >= 2 and stripped[1] == " " and stripped[0] in "eBGDAeE":
             lines.append(stripped)
     return lines
 

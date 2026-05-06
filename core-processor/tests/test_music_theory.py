@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
 import numpy as np
-from pipeline.music_theory import (
+from pipeline.shared.music_theory import (
     analyze_key,
     _detect_key,
     _build_histogram,
@@ -52,25 +52,25 @@ class TestKeyDetection(unittest.TestCase):
 
     def test_c_major_detected(self):
         hist = self._dominant_histogram(0, "major")
-        root, mode, conf = _detect_key(hist)
+        root, mode, conf, _ = _detect_key(hist, n_notes=12)
         self.assertEqual(root, 0)
         self.assertEqual(mode, "major")
 
     def test_e_minor_detected(self):
         hist = self._dominant_histogram(4, "minor")  # E = pitch class 4
-        root, mode, conf = _detect_key(hist)
+        root, mode, conf, _ = _detect_key(hist, n_notes=12)
         self.assertEqual(root, 4)
         self.assertEqual(mode, "minor")
 
     def test_d_minor_detected(self):
         hist = self._dominant_histogram(2, "minor")  # D = pitch class 2
-        root, mode, conf = _detect_key(hist)
+        root, mode, conf, _ = _detect_key(hist, n_notes=12)
         self.assertEqual(root, 2)
         self.assertEqual(mode, "minor")
 
     def test_confidence_between_minus1_and_1(self):
         hist = self._dominant_histogram(0, "major")
-        _, _, conf = _detect_key(hist)
+        _, _, conf, _ = _detect_key(hist, n_notes=12)
         self.assertGreaterEqual(conf, -1.0)
         self.assertLessEqual(conf, 1.0)
 
@@ -78,7 +78,7 @@ class TestKeyDetection(unittest.TestCase):
         """Each root should be detectable when given a pure scale histogram."""
         for root in range(12):
             hist = self._dominant_histogram(root, "minor")
-            detected_root, _, _ = _detect_key(hist)
+            detected_root, _, _, _ = _detect_key(hist, n_notes=12)
             self.assertEqual(detected_root, root,
                              f"Root {CHROMATIC[root]} not detected correctly")
 

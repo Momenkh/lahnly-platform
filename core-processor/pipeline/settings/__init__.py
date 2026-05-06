@@ -1,32 +1,65 @@
 """
-pipeline.settings — unified re-export package
-===============================================
-Importing from this package is identical to importing from the old
-pipeline/settings.py module.  All existing `from pipeline.settings import X`
-statements in the codebase continue to work without modification.
+pipeline.settings — unified settings package
+=============================================
+All pipeline code does:  from pipeline.settings import SOME_CONSTANT
+This file re-exports every constant from every settings sub-module so that
+single import statement always works, regardless of which instrument or stage
+the constant belongs to.
 
-Settings are split across files by pipeline stage:
-  guitar_range.py    — shared MIDI/Hz bounds (used by stages 2, 3, 5b)
-  separation.py      — Stage 1: Demucs source separation
-  pitch_extraction.py — Stage 2: basic-pitch thresholds and multi-pass config
-  note_cleaning.py   — Stage 3: confidence gate, duration filter, merge, polyphony
-  quantization.py    — Stage 4: BPM detection and grid-snap
-  key_detection.py   — Stage 5: Krumhansl-Schmuckler and scale bias
-  guitar_mapping.py  — Stage 6: fretboard mapping + melody isolation
-  chord_detection.py — Stage 7: strum grouping and chord validity
-  tab_generation.py  — Stage 8: ASCII tab layout
-  audio_synthesis.py — Stage 9: synthesized preview WAV
-  visualization.py   — Stages 10 & 11: fretboard diagram and chord sheet
+Layout
+------
+settings/
+  shared/          Constants used by all instruments
+    separation     Demucs model cascade, RMS thresholds
+    quantization   BPM detection, grid-snap tolerances
+    key_detection  Krumhansl-Schmuckler weights, scale bias
+    audio_synthesis Sample rate, waveform envelope
+    visualization  DPI, section lengths, row heights
+  guitar/          Guitar-specific constants
+    range          MIDI / Hz bounds for guitar
+    pitch          basic-pitch thresholds, multi-pass configs
+    cleaning       Confidence gates, duration filters, polyphony limits
+    mapping        Fretboard Viterbi DP, string/fret preferences
+    chords         Strum grouping, chord naming
+    tab            ASCII tab column widths, section lengths
+  bass/            Bass-specific constants (same sub-structure as guitar)
+  piano/           Piano-specific constants
+  vocals/          Vocals-specific constants
+  drums/           Drums onset-detection and hit-classification constants
 """
 
-from .guitar_range      import *   # noqa: F401,F403
-from .separation        import *   # noqa: F401,F403
-from .pitch_extraction  import *   # noqa: F401,F403
-from .note_cleaning     import *   # noqa: F401,F403
-from .quantization      import *   # noqa: F401,F403
-from .key_detection     import *   # noqa: F401,F403
-from .guitar_mapping    import *   # noqa: F401,F403
-from .chord_detection   import *   # noqa: F401,F403
-from .tab_generation    import *   # noqa: F401,F403
-from .audio_synthesis   import *   # noqa: F401,F403
-from .visualization     import *   # noqa: F401,F403
+# ── Shared (instrument-agnostic) ──────────────────────────────────────────────
+from .shared.separation      import *   # noqa: F401,F403
+from .shared.quantization    import *   # noqa: F401,F403
+from .shared.key_detection   import *   # noqa: F401,F403
+from .shared.audio_synthesis import *   # noqa: F401,F403
+from .shared.visualization   import *   # noqa: F401,F403
+from .shared.evaluation      import *   # noqa: F401,F403
+from .shared.presence        import *   # noqa: F401,F403
+
+# ── Guitar ────────────────────────────────────────────────────────────────────
+from .guitar.range    import *   # noqa: F401,F403
+from .guitar.pitch    import *   # noqa: F401,F403
+from .guitar.cleaning import *   # noqa: F401,F403
+from .guitar.mapping  import *   # noqa: F401,F403
+from .guitar.chords   import *   # noqa: F401,F403
+from .guitar.tab      import *   # noqa: F401,F403
+
+# ── Bass ──────────────────────────────────────────────────────────────────────
+from .bass.range    import *   # noqa: F401,F403
+from .bass.pitch    import *   # noqa: F401,F403
+from .bass.cleaning import *   # noqa: F401,F403
+
+# ── Piano ─────────────────────────────────────────────────────────────────────
+from .piano.range          import *   # noqa: F401,F403
+from .piano.pitch          import *   # noqa: F401,F403
+from .piano.cleaning       import *   # noqa: F401,F403
+from .piano.chord_recovery import *   # noqa: F401,F403
+
+# ── Vocals ────────────────────────────────────────────────────────────────────
+from .vocals.range    import *   # noqa: F401,F403
+from .vocals.pitch    import *   # noqa: F401,F403
+from .vocals.cleaning import *   # noqa: F401,F403
+
+# ── Drums ─────────────────────────────────────────────────────────────────────
+from .drums.onset import *   # noqa: F401,F403

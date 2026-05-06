@@ -38,7 +38,7 @@ def run(audio_path: str, no_separate: bool = False):
         pitch_input = audio_path
         print("  Skipped — using raw mix")
     else:
-        from pipeline.separation import separate_guitar, get_stem_path
+        from pipeline.shared.separation import separate_guitar, get_stem_path
         stem = get_stem_path()
         if os.path.isfile(stem):
             print("  Using saved guitar stem (delete outputs/00_guitar_stem.wav to re-run)")
@@ -47,7 +47,7 @@ def run(audio_path: str, no_separate: bool = False):
             pitch_input = separate_guitar(audio_path)
 
     separator("STAGE 1 — Pitch Extraction")
-    from pipeline.pitch_extraction import extract_pitches
+    from pipeline.instruments.guitar.pitch import extract_pitches
     raw_notes = extract_pitches(pitch_input, save=True)
 
     if raw_notes:
@@ -76,7 +76,7 @@ def run(audio_path: str, no_separate: bool = False):
 
     # ── Stage 2: Note Cleaning ────────────────────────────────────────────────
     separator("STAGE 2 — Note Cleaning")
-    from pipeline.note_cleaning import clean_notes, MIN_DURATION_S, CONFIDENCE_THRESHOLD, MERGE_GAP_S
+    from pipeline.instruments.guitar.cleaning import clean_notes, MIN_DURATION_S, CONFIDENCE_THRESHOLD, MERGE_GAP_S
 
     print(f"  Filters applied:")
     print(f"    Min duration  : {MIN_DURATION_S*1000:.0f}ms")
@@ -102,7 +102,7 @@ def run(audio_path: str, no_separate: bool = False):
 
     # ── Stage 2.5: Key Analysis ───────────────────────────────────────────────
     separator("STAGE 2.5 — Key / Scale Analysis")
-    from pipeline.music_theory import analyze_key, CHROMATIC, SCALES
+    from pipeline.shared.music_theory import analyze_key, CHROMATIC, SCALES
 
     key_info = analyze_key(cleaned_notes, save=True)
 
@@ -129,7 +129,7 @@ def run(audio_path: str, no_separate: bool = False):
 
     # ── Stage 3: Guitar Mapping ───────────────────────────────────────────────
     separator("STAGE 3 — Guitar Mapping")
-    from pipeline.guitar_mapping import map_to_guitar, HAND_SPAN, MAX_FRET
+    from pipeline.instruments.guitar.mapping import map_to_guitar, HAND_SPAN, MAX_FRET
 
     mapped_notes = map_to_guitar(cleaned_notes, key_info=key_info, save=True)
 
@@ -158,7 +158,7 @@ def run(audio_path: str, no_separate: bool = False):
 
     # ── Stage 4: Tab Generation ───────────────────────────────────────────────
     separator("STAGE 4 — Tab Generation")
-    from pipeline.tab_generation import generate_tabs, SECONDS_PER_COLUMN
+    from pipeline.instruments.guitar.tab import generate_tabs, SECONDS_PER_COLUMN
 
     tab_str = generate_tabs(mapped_notes, save=True)
     lines   = tab_str.strip().split("\n")
