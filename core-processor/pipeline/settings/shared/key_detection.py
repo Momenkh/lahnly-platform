@@ -73,3 +73,28 @@ KEY_PENTA_BIAS_GATE       = 0.03
 #     of gap, so the gap threshold can be kept low for genuine maqam songs.
 KEY_MAQAM_MIN_NOTES = 80    # fewer notes than this → force Western key
 KEY_MAQAM_MIN_GAP   = 0.04  # maqam must beat best Western score by this much
+
+# Capo detection ─────────────────────────────────────────────────────────────
+# After key detection, test capo positions 1..CAPO_SEARCH_MAX to check whether
+# a capo makes the key more guitar-friendly (more open strings in the scale).
+#
+# Open strings: E(4), A(9), D(2), G(7), B(11) — five pitch classes.
+# "Friendly" key = at least CAPO_MIN_FRIENDLY_STRINGS of these five in scale.
+# G major, C major, D major, Am, Em all score 5/5; A major, F major score 4/5.
+# Keys with scores < 4 (e.g. Ab, Db, Gb) are "guitar-unfriendly" and likely
+# played with a capo to reach a friendlier position.
+CAPO_SEARCH_MAX           = 5   # maximum capo fret to test (5 covers most songs)
+CAPO_MIN_FRIENDLY_STRINGS = 4   # minimum open-string count to call a key "friendly"
+
+# Per-segment key detection ───────────────────────────────────────────────────
+# The full-song key histogram conflates notes from different sections when a
+# song modulates.  Segmentation splits the note stream at silence gaps and
+# detects the key independently per section, so the stage 5b feedback filter
+# uses the correct key context for each part of the song.
+#
+# KEY_SEGMENT_MIN_GAP_S     — silence longer than this triggers a new segment.
+# KEY_SEGMENT_MIN_NOTES     — segments with fewer notes fall back to the global key.
+# KEY_SEGMENT_MIN_DURATION_S — segments shorter than this are merged with a neighbor.
+KEY_SEGMENT_MIN_GAP_S      = 2.0   # seconds of silence → new segment boundary
+KEY_SEGMENT_MIN_NOTES      = 16    # fewer notes → inherit from nearest reliable segment
+KEY_SEGMENT_MIN_DURATION_S = 15.0  # merge shorter segments into a neighbor

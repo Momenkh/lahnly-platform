@@ -17,6 +17,8 @@ import unittest
 import numpy as np
 from pipeline.shared.music_theory import (
     analyze_key,
+    analyze_key_segmented,
+    detect_capo,
     _detect_key,
     _build_histogram,
     _scale_pitch_classes,
@@ -150,7 +152,8 @@ class TestAnalyzeKeyEndToEnd(unittest.TestCase):
     def test_returns_required_fields(self):
         notes = notes_from_pitches([50, 52, 53, 55, 57, 58, 60])  # D natural minor
         result = analyze_key(notes, save=False)
-        for field in ["root", "root_midi", "mode", "scale", "scale_pcs", "key_str", "confidence", "histogram"]:
+        for field in ["root", "root_midi", "mode", "scale", "scale_pcs", "key_str",
+                      "confidence", "histogram", "capo_fret"]:
             self.assertIn(field, result, f"Missing field: {field}")
 
     def test_key_str_is_string(self):
@@ -158,6 +161,102 @@ class TestAnalyzeKeyEndToEnd(unittest.TestCase):
         result = analyze_key(notes, save=False)
         self.assertIsInstance(result["key_str"], str)
         self.assertGreater(len(result["key_str"]), 0)
+
+    def test_capo_fret_present_for_guitar(self):
+        notes = notes_from_pitches([60, 62, 64, 65, 67, 69, 71])
+        result = analyze_key(notes, save=False, instrument="guitar")
+        self.assertIn("capo_fret", result)
+        self.assertIsInstance(result["capo_fret"], int)
+
+    def test_capo_fret_absent_for_non_guitar(self):
+        """Non-guitar instruments always get capo_fret=0."""
+        notes = notes_from_pitches([60, 62, 64, 65, 67, 69, 71])
+        result = analyze_key(notes, save=False, instrument="piano")
+        self.assertEqual(result["capo_fret"], 0)
+
+
+class TestAnalyzeKeySegmented(unittest.TestCase):
+    """Tests for per-section key detection."""
+
+    def _make_notes(self, pitches: list[int], t_offset: float = 0.0) -> list[dict]:
+        return [
+            {"pitch": p, "start": t_offset + i * 0.5, "duration": 0.5, "confidence": 0.9}
+            for i, p in enumerate(pitches)
+        ]
+
+    def test_single_segment_returns_empty_segments_list(self):
+        """If there's only one section (no gap), segments should be empty."""
+        notes = self._make_notes([60, 62, 64, 65, 67, 69, 71] * 4)
+        global_key, segments = analyze_key_segmented(notes, instrument="guitar")
+        self.assertIn("root", global_key)
+        self.assertEqual(segments, [])
+
+    def test_gap_creates_two_segments(self):
+        """A silence gap >= KEY_SEGMENT_MIN_GAP_S should produce two segments."""
+        from pipeline.settings import KEY_SEGMENT_MIN_DURATION_S, KEY_SEGMENT_MIN_GAP_S
+
+        # Each repeat = 7 notes × 0.5s = 3.5s. Need > MIN_DURATION_S seconds per part.
+        n_repeats = max(5, int(KEY_SEGMENT_MIN_DURATION_S / (7 * 0.5)) + 1)
+        part1 = self._make_notes([60, 62, 64, 65, 67, 69, 71] * n_repeats, t_offset=0.0)
+        # Start second part well after the first ends + gap
+        t_gap_start = part1[-1]["start"] + part1[-1]["duration"] + KEY_SEGMENT_MIN_GAP_S + 1.0
+        part2 = self._make_notes([61, 63, 65, 66, 68, 70, 72] * n_repeats, t_offset=t_gap_start)
+        notes = part1 + part2
+        global_key, segments = analyze_key_segmented(notes, instrument="guitar")
+        self.assertGreaterEqual(len(segments), 2)
+
+    def test_global_key_always_present(self):
+        notes = self._make_notes([60, 62, 64])
+        global_key, _ = analyze_key_segmented(notes, instrument="guitar")
+        self.assertIn("scale_pcs", global_key)
+        self.assertIn("capo_fret", global_key)
+
+    def test_segments_have_required_fields(self):
+        from pipeline.settings import KEY_SEGMENT_MIN_DURATION_S, KEY_SEGMENT_MIN_GAP_S
+        n_repeats = max(5, int(KEY_SEGMENT_MIN_DURATION_S / (7 * 0.5)) + 1)
+        part1 = self._make_notes([60, 62, 64, 65, 67, 69, 71] * n_repeats, t_offset=0.0)
+        t2 = part1[-1]["start"] + part1[-1]["duration"] + KEY_SEGMENT_MIN_GAP_S + 1.0
+        part2 = self._make_notes([61, 63, 65, 66, 68, 70, 72] * n_repeats, t_offset=t2)
+        _, segments = analyze_key_segmented(part1 + part2, instrument="guitar")
+        for s in segments:
+            for field in ("seg_start", "seg_end", "scale_pcs", "key_str"):
+                self.assertIn(field, s, f"Segment missing field: {field}")
+
+
+class TestDetectCapo(unittest.TestCase):
+    """Tests for the capo inference heuristic."""
+
+    def test_guitar_friendly_key_no_capo(self):
+        # G major: all 5 open string PCs (E,A,D,G,B) are in the scale → score 5/5
+        self.assertEqual(detect_capo(root_midi=7, mode="major"), 0)
+
+    def test_guitar_friendly_minor_no_capo(self):
+        # E minor: all 5 open string PCs in scale → no capo needed
+        self.assertEqual(detect_capo(root_midi=4, mode="minor"), 0)
+
+    def test_unfriendly_key_gets_capo(self):
+        # Ab major (root=8): few open strings in scale.
+        # With capo 1 → G major (root=7): 5/5 open strings.
+        capo = detect_capo(root_midi=8, mode="major")
+        self.assertEqual(capo, 1)
+
+    def test_bb_major_capo_3(self):
+        # Bb major (root=10): unfriendly (E♭ key).
+        # Capo 3 → G major (10-3=7): all 5 open strings in scale.
+        capo = detect_capo(root_midi=10, mode="major")
+        self.assertIn(capo, {1, 2, 3})  # any capo that improves the score
+
+    def test_maqam_never_gets_capo(self):
+        self.assertEqual(detect_capo(root_midi=2, mode="maqam_hijaz"), 0)
+        self.assertEqual(detect_capo(root_midi=5, mode="maqam_kurd"),  0)
+
+    def test_capo_within_bounds(self):
+        """Returned capo fret is always 0-5."""
+        for root in range(12):
+            for mode in ("major", "minor"):
+                capo = detect_capo(root_midi=root, mode=mode)
+                self.assertGreaterEqual(capo, 0)
+                self.assertLessEqual(capo, 5)
 
 
 if __name__ == "__main__":

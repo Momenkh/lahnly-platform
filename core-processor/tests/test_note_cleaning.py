@@ -14,7 +14,11 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
-from pipeline.instruments.guitar.cleaning import clean_notes, _limit_polyphony
+from pipeline.instruments.guitar.cleaning import (
+    clean_notes, _limit_polyphony,
+    apply_key_confidence_filter,
+    apply_key_confidence_filter_segmented,
+)
 from pipeline.settings import CLEANING_TYPE_PARAMS, CLEANING_DEFAULT_MERGE_GAP_S
 
 # Pull thresholds from the default guitar mode so tests stay in sync with settings.
@@ -124,6 +128,116 @@ class TestEdgeCases(unittest.TestCase):
         result = clean_notes(notes, save=False)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["pitch"], 60)
+
+
+class TestKeyConfidenceFilter(unittest.TestCase):
+    """Tests for apply_key_confidence_filter including chord-tone protection."""
+
+    # C major scale PCs: C D E F G A B
+    KEY_INFO = {"scale_pcs": [0, 2, 4, 5, 7, 9, 11]}
+    CUTOFF   = 0.50
+
+    def _note(self, pitch, confidence):
+        return {"pitch": pitch, "start": 0.0, "duration": 0.5, "confidence": confidence}
+
+    def test_in_key_low_confidence_kept(self):
+        """In-key notes are kept even below the confidence cutoff."""
+        notes = [self._note(60, 0.1)]  # C4 is in C major
+        result = apply_key_confidence_filter(notes, self.KEY_INFO, conf_cutoff=self.CUTOFF)
+        self.assertEqual(len(result), 1)
+
+    def test_off_key_low_confidence_removed(self):
+        """Off-key + low-confidence notes are removed when no chord protection."""
+        notes = [self._note(61, 0.1)]  # Db4 not in C major
+        result = apply_key_confidence_filter(notes, self.KEY_INFO, conf_cutoff=self.CUTOFF)
+        self.assertEqual(result, [])
+
+    def test_off_key_high_confidence_kept(self):
+        """Off-key notes above the cutoff are kept (chromatic passing tones)."""
+        notes = [self._note(61, 0.8)]  # Db4 but high confidence
+        result = apply_key_confidence_filter(notes, self.KEY_INFO, conf_cutoff=self.CUTOFF)
+        self.assertEqual(len(result), 1)
+
+    def test_chord_tone_protection_keeps_off_key_note(self):
+        """Off-key + low-confidence note is kept when its PC is a chord tone."""
+        # Bb4 (PC=10) is off-key in C major but is the b7 of a G7 chord
+        notes  = [self._note(70, 0.1)]   # Bb4, confidence below cutoff
+        result = apply_key_confidence_filter(
+            notes, self.KEY_INFO, conf_cutoff=self.CUTOFF, protected_pcs={10}
+        )
+        self.assertEqual(len(result), 1)
+
+    def test_chord_tone_protection_does_not_affect_other_pcs(self):
+        """A note whose PC is not in protected_pcs is still removed normally."""
+        notes  = [self._note(63, 0.1)]   # Eb4 (PC=3), not in C major, not protected
+        result = apply_key_confidence_filter(
+            notes, self.KEY_INFO, conf_cutoff=self.CUTOFF, protected_pcs={10}  # only Bb protected
+        )
+        self.assertEqual(result, [])
+
+    def test_empty_protected_pcs_is_safe(self):
+        """Empty protected_pcs set behaves identically to no protection."""
+        notes  = [self._note(61, 0.1)]
+        result = apply_key_confidence_filter(
+            notes, self.KEY_INFO, conf_cutoff=self.CUTOFF, protected_pcs=set()
+        )
+        self.assertEqual(result, [])
+
+    def test_no_key_info_returns_all_notes(self):
+        """Missing key_info skips the filter entirely."""
+        notes  = [self._note(61, 0.1)]
+        result = apply_key_confidence_filter(notes, {}, conf_cutoff=self.CUTOFF)
+        self.assertEqual(len(result), 1)
+
+
+class TestKeyConfidenceFilterSegmented(unittest.TestCase):
+    """Tests for apply_key_confidence_filter_segmented."""
+
+    # Two segments: C major (0-10s), Bb major (20-30s)
+    C_MAJOR_PCS  = [0, 2, 4, 5, 7, 9, 11]
+    BB_MAJOR_PCS = [10, 0, 2, 3, 5, 7, 9]
+
+    SEGMENTS = [
+        {"seg_start": 0.0, "seg_end": 10.0, "scale_pcs": [0, 2, 4, 5, 7, 9, 11]},
+        {"seg_start": 20.0, "seg_end": 30.0, "scale_pcs": [10, 0, 2, 3, 5, 7, 9]},
+    ]
+    GLOBAL = {"scale_pcs": [0, 2, 4, 5, 7, 9, 11]}
+    CUTOFF = 0.50
+
+    def _n(self, pitch, start, confidence=0.1):
+        return {"pitch": pitch, "start": start, "duration": 0.5, "confidence": confidence}
+
+    def test_in_key_for_segment_kept(self):
+        """Bb (PC=10) is off-key globally but in Bb major segment — should be kept."""
+        note = self._n(pitch=70, start=25.0)  # Bb4, PC=10, in Bb major segment
+        result = apply_key_confidence_filter_segmented(
+            [note], self.SEGMENTS, self.GLOBAL, conf_cutoff=self.CUTOFF
+        )
+        self.assertEqual(len(result), 1)
+
+    def test_off_key_in_segment_removed(self):
+        """Db (PC=1) is off-key in C major segment AND globally — should be removed."""
+        note = self._n(pitch=61, start=5.0)  # Db4, PC=1, not in C major
+        result = apply_key_confidence_filter_segmented(
+            [note], self.SEGMENTS, self.GLOBAL, conf_cutoff=self.CUTOFF
+        )
+        self.assertEqual(result, [])
+
+    def test_no_segments_falls_back_to_global(self):
+        """Empty segments list → behaves like apply_key_confidence_filter."""
+        note = self._n(pitch=61, start=5.0)  # off-key, low-conf
+        result = apply_key_confidence_filter_segmented(
+            [note], [], self.GLOBAL, conf_cutoff=self.CUTOFF
+        )
+        self.assertEqual(result, [])
+
+    def test_note_outside_all_segments_uses_global(self):
+        """Note at 15.0s falls between segments — global key is the fallback."""
+        note = self._n(pitch=61, start=15.0)  # off-key globally
+        result = apply_key_confidence_filter_segmented(
+            [note], self.SEGMENTS, self.GLOBAL, conf_cutoff=self.CUTOFF
+        )
+        self.assertEqual(result, [])  # off-key in global C major → removed
 
 
 if __name__ == "__main__":

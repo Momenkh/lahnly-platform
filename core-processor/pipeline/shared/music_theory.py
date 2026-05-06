@@ -21,6 +21,8 @@ from pipeline.config import get_shared_dir
 from pipeline.settings import (
     KEY_PENTATONIC_MINOR_BIAS, KEY_PENTA_BIAS_GATE,
     KEY_MAQAM_MIN_GAP, KEY_MAQAM_MIN_NOTES,
+    CAPO_SEARCH_MAX, CAPO_MIN_FRIENDLY_STRINGS,
+    KEY_SEGMENT_MIN_GAP_S, KEY_SEGMENT_MIN_NOTES, KEY_SEGMENT_MIN_DURATION_S,
 )
 
 CHROMATIC      = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -135,6 +137,8 @@ def analyze_key(cleaned_notes: list[dict], save: bool = True, instrument: str = 
                       " (blues)"      if scale_name == "blues" else ""
         key_str = f"{root_name} {mode_label}{penta_label}"
 
+    capo_fret = detect_capo(root, mode) if instrument == "guitar" else 0
+
     result = {
         "root":       root_name,
         "root_midi":  root,
@@ -146,11 +150,15 @@ def analyze_key(cleaned_notes: list[dict], save: bool = True, instrument: str = 
         "confidence": round(float(confidence), 4),
         "candidates": candidates,
         "histogram":  {CHROMATIC[i]: round(float(histogram[i]), 4) for i in range(12)},
+        "capo_fret":  capo_fret,
     }
 
     print(f"[Stage 5] Detected key: {key_str}  (confidence {confidence:.2f})")
     print(f"[Stage 5] Top candidates: {[c['key_str'] for c in candidates[:3]]}")
     print(f"[Stage 5] Scale notes: {[CHROMATIC[pc] for pc in scale_pcs]}")
+    if capo_fret:
+        print(f"[Stage 5] Capo inferred: fret {capo_fret}  "
+              f"(key becomes guitar-friendly after transposing down {capo_fret} semitone(s))")
 
     if save:
         out_path = os.path.join(get_shared_dir(), "05_key_analysis.json")
@@ -159,6 +167,151 @@ def analyze_key(cleaned_notes: list[dict], save: bool = True, instrument: str = 
         print(f"[Stage 5] Saved -> {out_path}")
 
     return result
+
+
+def analyze_key_segmented(
+    notes: list[dict],
+    instrument: str = "guitar",
+) -> tuple[dict, list[dict]]:
+    """
+    Per-section key detection.
+
+    Splits the note stream at silence gaps >= KEY_SEGMENT_MIN_GAP_S, then detects
+    the key independently per segment.  Returns the global key (full-song histogram)
+    alongside a list of per-segment key dicts for use in the stage 5b filter.
+
+    Each segment dict has the same structure as analyze_key() plus:
+      "seg_start": float  — earliest note start time in the segment
+      "seg_end":   float  — latest note end time in the segment
+
+    Segments with fewer than KEY_SEGMENT_MIN_NOTES notes inherit the key from the
+    nearest reliable segment (the global key is the final fallback).
+
+    The global key_info is returned as the first element and should be used for:
+      - Tab header / key_str display
+      - Guitar mapping open-string bonuses (single Viterbi pass for the whole song)
+      - Capo detection
+
+    The segments list is used only by apply_key_confidence_filter_segmented().
+    """
+    # Global key — always run first; also populates capo_fret
+    global_key = analyze_key(notes, save=True, instrument=instrument)
+
+    # ── Build time-based segments ──────────────────────────────────────────────
+    if not notes:
+        return global_key, []
+
+    sorted_notes = sorted(notes, key=lambda n: n["start"])
+    # Find gap-based split points
+    split_times: list[float] = []
+    for i in range(1, len(sorted_notes)):
+        prev_end = sorted_notes[i - 1]["start"] + sorted_notes[i - 1]["duration"]
+        gap      = sorted_notes[i]["start"] - prev_end
+        if gap >= KEY_SEGMENT_MIN_GAP_S:
+            split_times.append(sorted_notes[i]["start"])
+
+    # Build segment note lists from split points
+    segs_notes: list[list[dict]] = []
+    seg_start_times: list[float] = []
+    prev_split = 0.0
+    seg_buf: list[dict] = []
+    split_idx = 0
+
+    for note in sorted_notes:
+        if split_idx < len(split_times) and note["start"] >= split_times[split_idx]:
+            if seg_buf:
+                segs_notes.append(seg_buf)
+                seg_start_times.append(seg_buf[0]["start"])
+                seg_buf = []
+            split_idx += 1
+        seg_buf.append(note)
+    if seg_buf:
+        segs_notes.append(seg_buf)
+        seg_start_times.append(seg_buf[0]["start"])
+
+    # Merge short segments (duration < MIN_DURATION_S) into a neighbor
+    def _seg_duration(notes_list: list[dict]) -> float:
+        if not notes_list:
+            return 0.0
+        end = max(n["start"] + n["duration"] for n in notes_list)
+        return end - notes_list[0]["start"]
+
+    merged: list[list[dict]] = []
+    for seg in segs_notes:
+        if merged and _seg_duration(seg) < KEY_SEGMENT_MIN_DURATION_S:
+            merged[-1] = merged[-1] + seg  # absorb into previous
+        else:
+            merged.append(seg)
+
+    # If we ended up with only one segment (no meaningful gap found), return early
+    if len(merged) <= 1:
+        return global_key, []
+
+    # ── Per-segment key detection ──────────────────────────────────────────────
+    segments: list[dict] = []
+    reliable_keys: list[dict] = []  # segments with enough notes
+
+    for seg_notes in merged:
+        seg_s = seg_notes[0]["start"]
+        seg_e = max(n["start"] + n["duration"] for n in seg_notes)
+
+        if len(seg_notes) >= KEY_SEGMENT_MIN_NOTES:
+            hist = _build_histogram(seg_notes)
+            root, mode, confidence, candidates = _detect_key(hist, len(seg_notes))
+            is_maqam   = mode.startswith("maqam_")
+            scale_name = mode if is_maqam else _best_scale(hist, root, mode, instrument=instrument)
+            scale_pcs  = _scale_pitch_classes(root, scale_name)
+            use_flats  = key_uses_flats(root, mode)
+            root_name  = note_name(root, use_flats)
+            if is_maqam:
+                key_str = f"{root_name} {MAQAM_LABELS[mode]}"
+            else:
+                mode_label  = "major" if mode == "major" else "minor"
+                penta_label = " (pentatonic)" if "pentatonic" in scale_name else \
+                              " (blues)"      if scale_name == "blues" else ""
+                key_str = f"{root_name} {mode_label}{penta_label}"
+
+            seg_key = {
+                "root": root_name, "root_midi": root, "mode": mode,
+                "use_flats": use_flats, "scale": scale_name,
+                "scale_pcs": scale_pcs, "key_str": key_str,
+                "confidence": round(float(confidence), 4),
+                "seg_start": seg_s, "seg_end": seg_e,
+            }
+            reliable_keys.append(seg_key)
+        else:
+            seg_key = {"seg_start": seg_s, "seg_end": seg_e, "inherited": True}
+
+        segments.append(seg_key)
+
+    # Fill unreliable segments with the nearest reliable neighbour
+    fallback = global_key  # final fallback if no reliable segments at all
+    for i, seg in enumerate(segments):
+        if seg.get("inherited"):
+            nearest = _nearest_reliable(i, segments, reliable_keys, fallback)
+            seg.update({k: v for k, v in nearest.items() if k not in ("seg_start", "seg_end")})
+            seg.pop("inherited", None)
+
+    # Log detected segments
+    print(f"[Stage 5] Segmented key analysis: {len(segments)} section(s)")
+    for s in segments:
+        print(f"[Stage 5]   {s['seg_start']:.1f}s - {s['seg_end']:.1f}s  ->  {s['key_str']}")
+
+    return global_key, segments
+
+
+def _nearest_reliable(
+    idx: int,
+    segments: list[dict],
+    reliable: list[dict],
+    fallback: dict,
+) -> dict:
+    """Return the nearest segment that has a proper key detection."""
+    if not reliable:
+        return fallback
+    # Find the reliable segment with smallest start-time distance
+    mid = segments[idx]["seg_start"]
+    return min(reliable, key=lambda s: abs(s["seg_start"] - mid))
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -272,6 +425,53 @@ def _best_scale(histogram: np.ndarray, root: int, mode: str, instrument: str = "
 def _scale_pitch_classes(root: int, scale_name: str) -> list[int]:
     intervals = SCALES[scale_name]
     return [(root + interval) % 12 for interval in intervals]
+
+
+# Open string pitch classes for standard guitar tuning: E A D G B
+_OPEN_STRING_PCS: frozenset[int] = frozenset({4, 9, 2, 7, 11})
+
+
+def detect_capo(root_midi: int, mode: str) -> int:
+    """
+    Infer capo position (1–CAPO_SEARCH_MAX) for guitar.
+
+    A capo on fret N shifts all open strings up by N semitones, making the
+    guitarist's chord shapes N semitones lower than the concert pitch.
+    If the detected key has few open strings in its scale (guitar-unfriendly),
+    we test each capo position to see if transposing the root down by N gives
+    a friendlier key.
+
+    Returns the lowest capo fret where the key scores >= CAPO_MIN_FRIENDLY_STRINGS
+    open string pitch classes AND scores strictly higher than the detected key.
+    Returns 0 (no capo) if no improvement is found or the key is already friendly.
+
+    Only applies to Western major/minor keys — maqam songs are not capo-annotated.
+    """
+    if mode.startswith("maqam_"):
+        return 0
+
+    diatonic = "major" if mode == "major" else "natural_minor"
+
+    def _open_string_score(root: int) -> int:
+        pcs = set(_scale_pitch_classes(root, diatonic))
+        return sum(1 for pc in _OPEN_STRING_PCS if pc in pcs)
+
+    base_score = _open_string_score(root_midi)
+    if base_score >= CAPO_MIN_FRIENDLY_STRINGS:
+        return 0  # already guitar-friendly — no capo needed
+
+    best_fret  = 0
+    best_score = base_score
+    for capo in range(1, CAPO_SEARCH_MAX + 1):
+        transposed_root = (root_midi - capo) % 12
+        score = _open_string_score(transposed_root)
+        if score > best_score:
+            best_score = score
+            best_fret  = capo
+            if score == len(_OPEN_STRING_PCS):
+                break  # perfect score — no need to test higher frets
+
+    return best_fret if best_score >= CAPO_MIN_FRIENDLY_STRINGS else 0
 
 
 def get_scale_pitch_classes(root_midi: int, scale_name: str) -> list[int]:

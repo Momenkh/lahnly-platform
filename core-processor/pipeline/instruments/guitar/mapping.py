@@ -71,11 +71,15 @@ def map_to_guitar(
     key_info: dict | None = None,
     guitar_type: str = "clean",
     guitar_role: str = "rhythm",
+    capo_fret: int = 0,
     save: bool = True,
 ) -> list[dict]:
+    capo_fret = capo_fret or (key_info.get("capo_fret", 0) if key_info else 0)
+
     if key_info:
+        capo_label = f"  capo: {capo_fret}" if capo_fret else ""
         print(f"[Stage 6] Mapping {len(cleaned_notes)} notes  "
-              f"(key: {key_info['key_str']})")
+              f"(key: {key_info['key_str']}{capo_label})")
     else:
         print(f"[Stage 6] Mapping {len(cleaned_notes)} notes")
 
@@ -83,7 +87,15 @@ def map_to_guitar(
     scale_pcs = set(key_info["scale_pcs"]) if key_info else set()
     notes_sorted = sorted(cleaned_notes, key=lambda n: n["start"])
 
-    mapped, unmapped = _viterbi_map(notes_sorted, scale_pcs, bend_tol)
+    # With a capo on fret N the guitarist's open strings are N semitones higher.
+    # We shift the tuning up by capo_fret so the Viterbi DP assigns fret numbers
+    # in the guitarist's frame (fret 0 = capo position, fret 1 = one above capo).
+    tuning = (
+        {s: p + capo_fret for s, p in STANDARD_TUNING.items()}
+        if capo_fret else STANDARD_TUNING
+    )
+
+    mapped, unmapped = _viterbi_map(notes_sorted, scale_pcs, bend_tol, tuning)
 
     if unmapped:
         print(f"[Stage 6] Warning: {unmapped} notes could not be mapped (out of range)")
@@ -106,6 +118,7 @@ def _viterbi_map(
     notes: list[dict],
     scale_pcs: set,
     bend_tol: int,
+    tuning: dict | None = None,
 ) -> tuple[list[dict], int]:
     """
     Globally optimal (string, fret) assignment via Viterbi DP.
@@ -122,6 +135,8 @@ def _viterbi_map(
     Returns (mapped_notes, n_unmapped).
     """
     INF = float("inf")
+    if tuning is None:
+        tuning = STANDARD_TUNING
 
     # Build candidate list; skip notes with no valid position
     note_cands: list[list[tuple[int, int]]] = []
@@ -129,7 +144,7 @@ def _viterbi_map(
     unmapped = 0
 
     for i, note in enumerate(notes):
-        cands = _all_positions(note["pitch"], bend_tol)
+        cands = _all_positions(note["pitch"], bend_tol, tuning)
         if cands:
             note_cands.append(cands)
             valid_idx.append(i)
@@ -144,11 +159,11 @@ def _viterbi_map(
     # ── Context-aware fret window precomputation ──────────────────────────────
     # Compute the median expected fret for the surrounding passage before the
     # forward pass, so each emission cost can be biased toward the local position.
-    context_centers = _compute_context_centers(notes, valid_idx, bend_tol)
+    context_centers = _compute_context_centers(notes, valid_idx, bend_tol, tuning)
 
     # ── Forward pass ──────────────────────────────────────────────────────────
     p0 = notes[valid_idx[0]]["pitch"]
-    dp   = [_emission_cost(s, f, scale_pcs, context_centers[0], p0) for s, f in note_cands[0]]
+    dp   = [_emission_cost(s, f, scale_pcs, context_centers[0], p0, tuning) for s, f in note_cands[0]]
     back: list[list[int]] = [[0] * len(c) for c in note_cands]
 
     for i in range(1, n):
@@ -163,7 +178,7 @@ def _viterbi_map(
 
         new_dp: list[float] = []
         for j, (s2, f2) in enumerate(cands_cur):
-            emit = _emission_cost(s2, f2, scale_pcs, context_centers[i], note_cur["pitch"])
+            emit = _emission_cost(s2, f2, scale_pcs, context_centers[i], note_cur["pitch"], tuning)
             best_cost = INF
             best_k    = 0
             for k, (s1, f1) in enumerate(cands_prev):
@@ -214,6 +229,7 @@ def _emission_cost(
     scale_pcs: set,
     context_center: float | None = None,
     note_pitch: int | None = None,
+    tuning: dict | None = None,
 ) -> float:
     """
     Intrinsic desirability of playing at (string, fret). Lower = preferred.
@@ -233,13 +249,14 @@ def _emission_cost(
         expected position.  Open strings are exempt when
         MAPPING_CONTEXT_OPEN_STRING_EXEMPT is True.
     """
+    _tuning = tuning if tuning is not None else STANDARD_TUNING
     cost = float(STRING_PREF.get(s, 9))
     cost += f * MAPPING_FRET_HEIGHT_WEIGHT
-    if f == 0 and STANDARD_TUNING[s] % 12 in scale_pcs:
+    if f == 0 and _tuning[s] % 12 in scale_pcs:
         cost -= MAPPING_OPEN_STRING_IN_KEY_BONUS
 
     if note_pitch is not None:
-        natural_pitch = STANDARD_TUNING[s] + f
+        natural_pitch = _tuning[s] + f
         bend_st = note_pitch - natural_pitch
         if bend_st > 0:
             cost += bend_st * MAPPING_BEND_SEMITONE_COST
@@ -298,7 +315,7 @@ def _transition_cost(
 
 # ── Context-aware fret window helpers ────────────────────────────────────────
 
-def _pitch_ref_fret(midi_pitch: int, bend_tol: int) -> float:
+def _pitch_ref_fret(midi_pitch: int, bend_tol: int, tuning: dict | None = None) -> float:
     """
     Pitch-based reference fret: mean fret across all valid (string, fret) candidates.
 
@@ -310,7 +327,7 @@ def _pitch_ref_fret(midi_pitch: int, bend_tol: int) -> float:
     Used exclusively by _compute_context_centers.
     Returns 0.0 if the pitch has no valid positions (should not occur in practice).
     """
-    cands = _all_positions(midi_pitch, bend_tol)
+    cands = _all_positions(midi_pitch, bend_tol, tuning)
     if not cands:
         return 0.0
     return sum(f for _, f in cands) / len(cands)
@@ -320,6 +337,7 @@ def _compute_context_centers(
     notes: list[dict],
     valid_idx: list[int],
     bend_tol: int,
+    tuning: dict | None = None,
 ) -> list[float]:
     """
     Precompute the context fret center for each valid note.
@@ -334,7 +352,7 @@ def _compute_context_centers(
     import statistics
 
     ref_frets = [
-        _pitch_ref_fret(notes[orig_i]["pitch"], bend_tol)
+        _pitch_ref_fret(notes[orig_i]["pitch"], bend_tol, tuning)
         for orig_i in valid_idx
     ]
     times = [notes[orig_i]["start"] for orig_i in valid_idx]
@@ -353,13 +371,20 @@ def _compute_context_centers(
 
 # ── Position helpers ──────────────────────────────────────────────────────────
 
-def _all_positions(midi_pitch: int, bend_tolerance: int = MAPPING_BEND_TOLERANCE) -> list[tuple[int, int]]:
+def _all_positions(
+    midi_pitch: int,
+    bend_tolerance: int = MAPPING_BEND_TOLERANCE,
+    tuning: dict | None = None,
+) -> list[tuple[int, int]]:
     """
     All valid (string, fret) positions for a MIDI pitch.
     Pitches up to bend_tolerance semitones above MAX_FRET are clamped to fret 21.
+    tuning: open-string MIDI pitches keyed by string number (1-6); defaults to
+            STANDARD_TUNING. Pass a capo-shifted tuning for capo support.
     """
+    _tuning = tuning if tuning is not None else STANDARD_TUNING
     positions = []
-    for string_num, open_pitch in STANDARD_TUNING.items():
+    for string_num, open_pitch in _tuning.items():
         fret = midi_pitch - open_pitch
         if 0 <= fret <= MAPPING_MAX_FRET:
             positions.append((string_num, fret))

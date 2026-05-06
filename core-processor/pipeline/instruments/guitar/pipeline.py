@@ -181,37 +181,60 @@ def run_guitar_pipeline(args) -> None:
         print("[Stage 4] Skipped — quantization disabled")
         tempo_info = None
 
-    # ── Stage 5: Key / Scale Analysis ────────────────────────────────────────
+    # ── Stage 5: Key / Scale Analysis (global + per-segment) ─────────────────
     if args.from_stage <= 5:
-        from pipeline.shared.music_theory import analyze_key
-        key_info = analyze_key(cleaned_notes, instrument="guitar")
+        from pipeline.shared.music_theory import analyze_key_segmented
+        key_info, key_segments = analyze_key_segmented(cleaned_notes, instrument="guitar")
     else:
         from pipeline.shared.music_theory import load_key_analysis
         try:
             print("[Stage 5] Skipped — loading saved key analysis")
             key_info = load_key_analysis()
         except FileNotFoundError:
-            from pipeline.shared.music_theory import analyze_key
+            from pipeline.shared.music_theory import analyze_key_segmented
             print("[Stage 5] No saved key analysis — running now")
-            key_info = analyze_key(cleaned_notes, instrument="guitar")
+            key_info, key_segments = analyze_key_segmented(cleaned_notes, instrument="guitar")
+        key_segments = []  # segments not persisted; fall back to global key for stage 5b
 
     # ── Stage 5b: Key-context feedback (octave correction + confidence filter) ──
-    from pipeline.instruments.guitar.cleaning import apply_key_octave_correction, apply_key_confidence_filter
+    from pipeline.instruments.guitar.cleaning import (
+        apply_key_octave_correction,
+        apply_key_confidence_filter,
+        apply_key_confidence_filter_segmented,
+    )
+    from pipeline.instruments.guitar.chords import get_chord_tone_pcs
     from pipeline.settings import CLEANING_KEY_CONFIDENCE_CUTOFF
+
+    # Pre-chord pass: collect pitch classes that appear in any chord group so the
+    # key-confidence filter does not delete legitimate chromatic chord tones
+    # (e.g. the b7 of a V7 chord in C major, or the b3 of a borrowed iv chord).
+    protected_pcs = get_chord_tone_pcs(cleaned_notes, tempo_info=tempo_info)
+    if protected_pcs:
+        print(f"[Stage 5b] Chord-tone protection active for PCs: "
+              f"{sorted(protected_pcs)}")
+
     cleaned_notes = apply_key_octave_correction(cleaned_notes, key_info)
-    cleaned_notes = apply_key_confidence_filter(cleaned_notes, key_info,
-                                                conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF)
+    cleaned_notes = apply_key_confidence_filter_segmented(
+        cleaned_notes, key_segments, key_info,
+        conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF,
+        protected_pcs=protected_pcs,
+    )
     # Apply the same corrections to the pre-quantization copy so the audio
     # synthesis path gets accurate pitch and the same note set.
     pre_quant_notes = apply_key_octave_correction(pre_quant_notes, key_info)
-    pre_quant_notes = apply_key_confidence_filter(pre_quant_notes, key_info,
-                                                  conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF)
+    pre_quant_notes = apply_key_confidence_filter_segmented(
+        pre_quant_notes, key_segments, key_info,
+        conf_cutoff=CLEANING_KEY_CONFIDENCE_CUTOFF,
+        protected_pcs=protected_pcs,
+    )
 
     # ── Stage 6: Guitar Mapping ───────────────────────────────────────────────
+    capo_fret = key_info.get("capo_fret", 0)
     if args.from_stage <= 6:
         from pipeline.instruments.guitar.mapping import map_to_guitar
         mapped_notes = map_to_guitar(cleaned_notes, key_info=key_info,
-                                     guitar_type=args.guitar_type, guitar_role=args.guitar_role)
+                                     guitar_type=args.guitar_type, guitar_role=args.guitar_role,
+                                     capo_fret=capo_fret)
     else:
         from pipeline.instruments.guitar.mapping import load_mapped_notes
         print("[Stage 6] Skipped — loading saved mapped notes")
@@ -247,7 +270,7 @@ def run_guitar_pipeline(args) -> None:
     # the 5b filters already run on pre_quant_notes.
     audio_mapped = _map(pre_quant_notes, key_info=key_info,
                         guitar_type=args.guitar_type, guitar_role=args.guitar_role,
-                        save=False)
+                        capo_fret=capo_fret, save=False)
     audio_melody, _ = isolate_melody(audio_mapped,
                                      min_pitch=MELODY_MIN_PITCH.get(args.guitar_role, 0))
     audio_notes = audio_melody if args.guitar_role == "lead" else audio_mapped
@@ -278,7 +301,7 @@ def run_guitar_pipeline(args) -> None:
     # lead: melody only (single-voice); rhythm/acoustic: all mapped notes (chord columns)
     if args.from_stage <= 8:
         from pipeline.instruments.guitar.tab import generate_tabs
-        tab_str = generate_tabs(tab_notes, chord_groups=chord_groups, tempo_info=tempo_info)
+        tab_str = generate_tabs(tab_notes, chord_groups=chord_groups, tempo_info=tempo_info, capo_fret=capo_fret)
     else:
         from pipeline.instruments.guitar.tab import load_tabs
         print("[Stage 8] Skipped — loading saved tabs")

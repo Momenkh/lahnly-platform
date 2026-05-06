@@ -43,3 +43,18 @@ QUANTIZATION_BPM_MAX = 240.0
 # exceeds this many milliseconds the pipeline emits a warning.  High instability
 # means the tempo estimate is uncertain and tab alignment may be poor.
 QUANTIZATION_INSTABILITY_WARN_MS = 15.0
+
+# Time signature inference ────────────────────────────────────────────────────
+# After BPM detection, onset autocorrelation is sampled at multiples of the
+# beat period to determine how many beats group into a bar.
+#
+# TIME_SIG_CANDIDATES  — bar-level numerators to test (denominator assumed = 4).
+# TIME_SIG_4_4_BIAS    — score bonus added to the 4/4 candidate to prefer it
+#                        when evidence is ambiguous.  Keeps common-time songs
+#                        from being flipped to 3/4 by sparse onset patterns.
+# TIME_SIG_6_8_RATIO   — if the dotted-quarter lag (1.5×beat) autocorrelation
+#                        reaches this fraction of the 3-beat lag score, the
+#                        triple-meter winner is reported as 6/8 rather than 3/4.
+TIME_SIG_CANDIDATES = [2, 3, 4]   # numerators to test
+TIME_SIG_4_4_BIAS   = 0.05        # fractional bonus to the 4/4 candidate
+TIME_SIG_6_8_RATIO  = 0.85        # dotted-quarter / 3-beat ratio for 6/8 vs 3/4

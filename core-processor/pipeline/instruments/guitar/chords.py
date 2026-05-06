@@ -129,6 +129,53 @@ def detect_chords(
     return solo_notes, chord_groups
 
 
+def get_chord_tone_pcs(
+    notes: list[dict],
+    tempo_info: dict | None = None,
+) -> set[int]:
+    """
+    Lightweight pre-pass to collect pitch classes that appear as chord tones.
+
+    Runs the same grouping + quality gates as detect_chords but on cleaned
+    (un-mapped) notes, so it can be called before Stage 6. Returns the set of
+    pitch classes (0-11) found in any qualifying chord group.
+
+    Used by apply_key_confidence_filter to protect legitimate chromatic chord
+    tones (e.g. the b7 in a V7 chord) from being deleted as "off-key".
+    """
+    if not notes:
+        return set()
+
+    if tempo_info and tempo_info.get("beat_s"):
+        strum_s = min(CHORD_DEFAULT_STRUM_S, tempo_info["beat_s"] * CHORD_STRUM_BEAT_FRACTION)
+    else:
+        strum_s = CHORD_DEFAULT_STRUM_S
+
+    sorted_notes = sorted(notes, key=lambda n: n["start"])
+    groups       = _group_simultaneous(sorted_notes, strum_s)
+
+    protected: set[int] = set()
+    for group in groups:
+        unique_pcs = set(n["pitch"] % 12 for n in group)
+        duration   = (max(n["start"] + n["duration"] for n in group)
+                      - min(n["start"] for n in group))
+
+        qualifies = False
+        if len(unique_pcs) >= CHORD_MIN_UNIQUE_PCS and duration >= CHORD_MIN_DURATION_S:
+            if len(group) >= CHORD_MIN_NOTES:
+                qualifies = True
+            elif len(group) == 2 and len(unique_pcs) == 2:
+                pcs_sorted = sorted(unique_pcs)
+                interval   = (pcs_sorted[1] - pcs_sorted[0]) % 12
+                if interval in CHORD_POWER_INTERVALS:
+                    qualifies = True
+
+        if qualifies:
+            protected |= unique_pcs
+
+    return protected
+
+
 def load_chord_detection() -> tuple[list[dict], list[dict]]:
     path = os.path.join(get_instrument_dir("guitar"), "07_chords.json")
     with open(path) as f:

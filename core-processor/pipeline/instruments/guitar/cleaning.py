@@ -245,16 +245,22 @@ def apply_key_confidence_filter(
     notes: list[dict],
     key_info: dict,
     conf_cutoff: float = CLEANING_KEY_CONFIDENCE_CUTOFF,
+    protected_pcs: set[int] | None = None,
 ) -> list[dict]:
     """
     Retroactive cleanup using key context.
 
-    Removes notes that are BOTH:
+    Removes notes that are ALL THREE of:
       - Not in the detected key's scale (off-key pitch class)
       - Below conf_cutoff confidence
+      - Not a chord tone (pitch class absent from protected_pcs)
 
-    Notes that are in-key, or that have high confidence (likely chromatic
-    passing tones or accidentals), are kept.
+    Notes that are in-key, have high confidence (chromatic passing tones),
+    or belong to a detected chord voicing are kept.
+
+    protected_pcs: set of pitch classes (0-11) found in any chord group
+    during the pre-chord pass (get_chord_tone_pcs). Pass None to skip
+    chord-tone protection (legacy behaviour).
     """
     if not key_info:
         return notes
@@ -263,16 +269,77 @@ def apply_key_confidence_filter(
     if not scale_pcs:
         return notes
 
+    chord_protected = protected_pcs or set()
     kept, removed = [], 0
     for note in notes:
-        in_key = note["pitch"] % 12 in scale_pcs
-        if not in_key and note["confidence"] < conf_cutoff:
+        pc     = note["pitch"] % 12
+        in_key = pc in scale_pcs
+        if not in_key and note["confidence"] < conf_cutoff and pc not in chord_protected:
             removed += 1
         else:
             kept.append(note)
 
     if removed:
         print(f"[Stage 5b] Key-confidence filter: removed {removed} off-key "
+              f"low-confidence notes  (conf < {conf_cutoff})")
+    if protected_pcs:
+        n_protected = sum(
+            1 for n in notes
+            if n["pitch"] % 12 not in scale_pcs
+            and n["confidence"] < conf_cutoff
+            and n["pitch"] % 12 in protected_pcs
+        )
+        if n_protected:
+            print(f"[Stage 5b] Chord-tone protection: kept {n_protected} off-key "
+                  f"notes that are chord tones")
+    return kept
+
+
+def apply_key_confidence_filter_segmented(
+    notes: list[dict],
+    segments: list[dict],
+    global_key_info: dict,
+    conf_cutoff: float = CLEANING_KEY_CONFIDENCE_CUTOFF,
+    protected_pcs: set[int] | None = None,
+) -> list[dict]:
+    """
+    Per-segment variant of apply_key_confidence_filter.
+
+    Each note is checked against the scale of the segment it falls in, so notes
+    that are off-key for the global key but diatonic in their local section are
+    preserved.  Falls back to global_key_info for notes outside any segment.
+    """
+    if not segments:
+        return apply_key_confidence_filter(notes, global_key_info, conf_cutoff, protected_pcs)
+
+    import bisect
+    seg_starts = [s["seg_start"] for s in segments]
+    chord_protected = protected_pcs or set()
+
+    kept, removed = [], 0
+    for note in notes:
+        t  = note["start"]
+        pc = note["pitch"] % 12
+
+        # Find the segment this note belongs to
+        idx = bisect.bisect_right(seg_starts, t) - 1
+        if 0 <= idx < len(segments) and t <= segments[idx]["seg_end"]:
+            scale_pcs = set(segments[idx].get("scale_pcs", []))
+        else:
+            scale_pcs = set(global_key_info.get("scale_pcs", []))
+
+        if not scale_pcs:
+            kept.append(note)
+            continue
+
+        in_key = pc in scale_pcs
+        if not in_key and note["confidence"] < conf_cutoff and pc not in chord_protected:
+            removed += 1
+        else:
+            kept.append(note)
+
+    if removed:
+        print(f"[Stage 5b] Segmented key-confidence filter: removed {removed} off-key "
               f"low-confidence notes  (conf < {conf_cutoff})")
     return kept
 

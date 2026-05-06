@@ -27,7 +27,7 @@ Rules:
 
 import os
 from pipeline.config import get_instrument_dir
-from pipeline.settings import TAB_COLS_PER_BLOCK, TAB_DEFAULT_SECONDS_PER_COL
+from pipeline.settings import TAB_COLS_PER_BLOCK, TAB_DEFAULT_SECONDS_PER_COL, QUANTIZATION_SUBDIVISION
 
 STRING_NAMES = {1: "e", 2: "B", 3: "G", 4: "D", 5: "A", 6: "E"}
 
@@ -36,6 +36,7 @@ def generate_tabs(
     notes: list[dict],
     chord_groups: list[dict] | None = None,   # kept for signature compat, not used
     tempo_info: dict | None = None,
+    capo_fret: int = 0,
     save: bool = True,
 ) -> str:
     if not notes:
@@ -44,6 +45,13 @@ def generate_tabs(
     spc     = tempo_info["subdivision_s"] if tempo_info else TAB_DEFAULT_SECONDS_PER_COL
     bpm_str = f"  BPM: {tempo_info['bpm']:.1f}" if tempo_info else ""
     print(f"[Stage 8] Generating tabs for {len(notes)} notes{bpm_str}...")
+
+    # Bar line spacing: number of 16th-note columns per bar.
+    # Formula: (ts_num / ts_den) × 4 quarter notes/whole × QUANTIZATION_SUBDIVISION subdivisions/quarter
+    # 4/4 → 16, 3/4 → 12, 2/4 → 8, 6/8 → 12 (6 eighths = 3 quarters on quarter-note grid)
+    ts_num   = tempo_info.get("time_sig_num", 4) if tempo_info else 4
+    ts_den   = tempo_info.get("time_sig_den", 4) if tempo_info else 4
+    bar_cols = (ts_num * 4 * QUANTIZATION_SUBDIVISION) // ts_den   # cols per bar
 
     max_start  = max(n["start"] for n in notes)
     total_cols = int(max_start / spc) + TAB_COLS_PER_BLOCK
@@ -100,21 +108,25 @@ def generate_tabs(
             cells: list[str] = []
             col = col_start
             while col < col_end:
+                # Insert bar line at bar boundary (not at the outer left delimiter)
+                if col > col_start and col % bar_cols == 0:
+                    cells.append("|")
+
                 if col in grid[string_num]:
                     fret_str, dur_cols = grid[string_num][col]
-                    # Fret label padded to col_w, then trailing dashes for remaining duration
-                    label     = fret_str.ljust(col_w, "-")
-                    trail_len = max(0, dur_cols - 1) * col_w
-                    trail     = "-" * trail_len
-                    combined  = label + trail
-                    # Clip to remaining columns in block
-                    remaining = (col_end - col) * col_w
-                    combined  = combined[:remaining].ljust(remaining, "-")
-                    cells.append(combined)
-                    col += max(1, dur_cols)
+                    end_col = min(col_end, col + max(1, dur_cols))
+                    # First column: fret label (padded/clipped to col_w)
+                    cells.append(fret_str.ljust(col_w, "-")[:col_w])
+                    # Remaining columns in the duration span — insert bar lines as needed
+                    for c in range(col + 1, end_col):
+                        if c % bar_cols == 0:
+                            cells.append("|")
+                        cells.append("-" * col_w)
+                    col = end_col
                 else:
                     cells.append("-" * col_w)
                     col += 1
+
             lines.append(f"{STRING_NAMES[string_num]} |{''.join(cells)}|")
 
         blocks.append("\n".join(lines))
@@ -126,9 +138,17 @@ def generate_tabs(
         out_path = os.path.join(get_instrument_dir("guitar"), "08_tabs.txt")
         with open(out_path, "w", encoding="utf-8") as f:
             f.write("# Guitar Tabs\n")
-            f.write(f"# {len(notes)} notes  |  {len(blocks)} blocks\n\n")
+            f.write(f"# {len(notes)} notes  |  {len(blocks)} blocks  |  Time: {ts_num}/{ts_den}\n")
+            if capo_fret:
+                f.write(f"# Capo: {capo_fret}\n")
+            f.write("\n")
             f.write(tab_str)
-        print(f"[Stage 8] Saved -> {out_path}  ({len(blocks)} blocks)")
+        extras = []
+        if capo_fret:
+            extras.append(f"Capo {capo_fret}")
+        extras.append(f"Time {ts_num}/{ts_den}")
+        print(f"[Stage 8] Saved -> {out_path}  ({len(blocks)} blocks)"
+              + (f"  [{', '.join(extras)}]" if extras else ""))
 
     return tab_str
 
