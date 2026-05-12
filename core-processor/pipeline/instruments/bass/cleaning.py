@@ -42,6 +42,26 @@ from pipeline.settings import (
     BASS_ISOLATION_ENABLED,
     BASS_ISOLATION_WINDOW_S,
     BASS_ISOLATION_MIN_TOTAL,
+    BASS_ISOLATION_PITCH_AWARE,
+    BASS_ISOLATION_MAX_INTERVAL_ST,
+    BASS_POLY_ROOT_PROTECTION,
+    BASS_POLY_HEIGHT_PENALTY_ST,
+    BASS_POLY_HEIGHT_PENALTY_COEF,
+    BASS_BPM_FAST_THRESHOLD_BPM,
+    BASS_BPM_FAST_SUBDIV,
+    BASS_OCTAVE_DUP_ENABLED,
+    BASS_OCTAVE_DUP_MIDI_THRESHOLD,
+    BASS_OCTAVE_DUP_WINDOW_S,
+    HARMONIC_COHERENCE_ENABLED,
+    HARMONIC_CONF_OVERRIDE,
+    SPECTRAL_PRESENCE_ENABLED,
+    SPECTRAL_PRESENCE_MIN_ENERGY,
+    SPECTRAL_PRESENCE_CONF_OVERRIDE,
+    BASS_ATTACK_GATE_ENABLED,
+    ATTACK_GATE_PRE_WINDOW_S,
+    ATTACK_GATE_POST_WINDOW_S,
+    ATTACK_GATE_MIN_RATIO,
+    ATTACK_GATE_CONF_OVERRIDE,
     BASS_HIGH_PITCH_FLOOR_1,
     BASS_HIGH_PITCH_REDUCTION_1,
     BASS_HIGH_PITCH_FLOOR_2,
@@ -85,9 +105,10 @@ def clean_notes_bass(
     else:
         merge_gap = BASS_DEFAULT_MERGE_GAP_S
 
-    # Adaptive min duration
+    # Adaptive min duration (fast-BPM override uses finer subdivision)
     if bpm:
-        bpm_min_dur = 60.0 / (bpm * bpm_subdiv)
+        eff_subdiv  = BASS_BPM_FAST_SUBDIV if bpm >= BASS_BPM_FAST_THRESHOLD_BPM else bpm_subdiv
+        bpm_min_dur = 60.0 / (bpm * eff_subdiv)
         min_dur = round(
             max(BASS_BPM_MIN_DUR_CLAMP_MIN_S,
                 min(BASS_BPM_MIN_DUR_CLAMP_MAX_S, bpm_min_dur)),
@@ -147,6 +168,16 @@ def clean_notes_bass(
     notes  = _merge_nearby_bass(notes, gap_threshold=merge_gap, merge_ratio=merge_ratio)
     print(f"[Stage 3B] After merging nearby     : {len(notes):4d}  (merged  {before - len(notes)})")
 
+    # 4b. Octave duplicate correction: note P above C3 alongside P-12 → shift P down
+    if BASS_OCTAVE_DUP_ENABLED:
+        before = len(notes)
+        notes  = _correct_octave_duplicates_bass(notes,
+                                                  BASS_OCTAVE_DUP_MIDI_THRESHOLD,
+                                                  BASS_OCTAVE_DUP_WINDOW_S)
+        removed = before - len(notes)
+        if removed:
+            print(f"[Stage 3B] After octave-dup fix     : {len(notes):4d}  (removed {removed} phantom harmonics)")
+
     # 5. Local pitch context filter
     local_max_dev = BASS_LOCAL_PITCH_MAX_DEV.get(bass_style)
     if local_max_dev is not None:
@@ -161,15 +192,67 @@ def clean_notes_bass(
         if removed:
             print(f"[Stage 3B] After local pitch filter : {len(notes):4d}  (removed {removed})")
 
-    # 6. Ghost note isolation filter
+    # 6. Ghost note isolation filter (pitch-aware upgrade)
     if BASS_ISOLATION_ENABLED:
         before = len(notes)
-        notes  = _filter_isolated_notes_bass(notes, BASS_ISOLATION_WINDOW_S, BASS_ISOLATION_MIN_TOTAL)
+        if BASS_ISOLATION_PITCH_AWARE:
+            from pipeline.shared.spectral import filter_isolated_notes_pitch_aware
+            notes = filter_isolated_notes_pitch_aware(
+                notes,
+                window_s=BASS_ISOLATION_WINDOW_S,
+                min_neighbors=2,
+                max_interval_st=BASS_ISOLATION_MAX_INTERVAL_ST,
+            )
+        else:
+            notes = _filter_isolated_notes_bass(notes, BASS_ISOLATION_WINDOW_S, BASS_ISOLATION_MIN_TOTAL)
         removed = before - len(notes)
         if removed:
             print(f"[Stage 3B] After isolation filter   : {len(notes):4d}  (removed {removed})")
 
-    # 7. Polyphony limit (bass is typically monophonic)
+    # 6b. Spectral gates — pitch-specific ghost note removal
+    from pipeline.shared.separation import get_stem_path_for
+    _stem = get_stem_path_for("bass")
+    if os.path.isfile(_stem):
+        from pipeline.shared.spectral import (
+            compute_stem_cqt,
+            check_harmonic_coherence,
+            spectral_presence_gate,
+            attack_envelope_gate,
+        )
+        import librosa as _librosa
+        _cqt, _sr, _hop = compute_stem_cqt(_stem)
+        _stem_audio, _sr2 = _librosa.load(_stem, sr=22050, mono=True)
+
+        if HARMONIC_COHERENCE_ENABLED:
+            before = len(notes)
+            notes  = check_harmonic_coherence(notes, _cqt, _sr, _hop,
+                                              dominance_ratio=2.5,
+                                              conf_override=HARMONIC_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3B] After harmonic coherence : {len(notes):4d}  (removed {removed} overtones)")
+
+        if SPECTRAL_PRESENCE_ENABLED:
+            before = len(notes)
+            notes  = spectral_presence_gate(notes, _cqt, _sr, _hop,
+                                            min_energy=SPECTRAL_PRESENCE_MIN_ENERGY,
+                                            conf_override=SPECTRAL_PRESENCE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3B] After spectral presence  : {len(notes):4d}  (removed {removed} absent pitches)")
+
+        if BASS_ATTACK_GATE_ENABLED:
+            before = len(notes)
+            notes  = attack_envelope_gate(notes, _stem_audio, _sr2,
+                                          pre_window_s=ATTACK_GATE_PRE_WINDOW_S,
+                                          post_window_s=ATTACK_GATE_POST_WINDOW_S,
+                                          min_ratio=ATTACK_GATE_MIN_RATIO,
+                                          conf_override=ATTACK_GATE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3B] After attack gate        : {len(notes):4d}  (removed {removed} no-ramp notes)")
+
+    # 7. Polyphony limit (smart eviction)
     before = len(notes)
     notes  = _limit_polyphony_bass(notes, max_poly=max_poly)
     print(f"[Stage 3B] After polyphony limit    : {len(notes):4d}  (removed {before - len(notes)})")
@@ -351,6 +434,43 @@ def _merge_nearby_bass(
     return merged
 
 
+def _correct_octave_duplicates_bass(
+    notes: list[dict],
+    midi_threshold: int,
+    window_s: float,
+) -> list[dict]:
+    """
+    Remove upper-register bass notes that co-occur with their octave-below fundamental.
+    When pitch P (>= midi_threshold) exists alongside P-12 within ±window_s, P is
+    almost certainly a phantom harmonic — bass doesn't play both octaves simultaneously.
+    The lower note (P-12) is the fundamental; the upper note is dropped.
+    """
+    import bisect
+    if not notes:
+        return notes
+
+    starts = sorted(n["start"] for n in notes)
+    lower_pitches_at = {}  # pitch → list of starts for that pitch
+    for n in notes:
+        lower_pitches_at.setdefault(n["pitch"], []).append(n["start"])
+
+    to_remove = set()
+    for i, note in enumerate(notes):
+        p = note["pitch"]
+        if p < midi_threshold:
+            continue
+        p_below = p - 12
+        if p_below not in lower_pitches_at:
+            continue
+        t = note["start"]
+        for t_below in lower_pitches_at[p_below]:
+            if abs(t - t_below) <= window_s:
+                to_remove.add(i)
+                break
+
+    return [n for i, n in enumerate(notes) if i not in to_remove]
+
+
 def _local_pitch_filter_bass(
     notes: list[dict],
     window_s: float,
@@ -402,7 +522,7 @@ def _filter_isolated_notes_bass(
 
 
 def _limit_polyphony_bass(notes: list[dict], max_poly: int) -> list[dict]:
-    """Keep at most max_poly simultaneously active notes (evict lowest confidence first)."""
+    """Keep at most max_poly simultaneously active notes (smart eviction)."""
     if not notes:
         return notes
 
@@ -415,16 +535,23 @@ def _limit_polyphony_bass(notes: list[dict], max_poly: int) -> list[dict]:
     active    = {}
     to_remove = set()
 
+    def _eviction_score_bass(idx):
+        note    = active[idx]
+        conf    = float(note.get("confidence", 0.0))
+        pitches = [active[j]["pitch"] for j in active]
+        is_lowest  = note["pitch"] == min(pitches)
+        root_bonus = 0.5 if (BASS_POLY_ROOT_PROTECTION and is_lowest) else 0.0
+        median_p   = sorted(pitches)[len(pitches) // 2]
+        over       = max(0, note["pitch"] - median_p - BASS_POLY_HEIGHT_PENALTY_ST)
+        return (1.0 - conf) + over * BASS_POLY_HEIGHT_PENALTY_COEF - root_bonus
+
     for _time, event_type, idx in events:
         if idx in to_remove:
             continue
         if event_type == 0:
             active[idx] = notes[idx]
             while len(active) > max_poly:
-                worst = min(active, key=lambda i: (
-                    active[i]["confidence"],
-                    -active[i]["pitch"],
-                ))
+                worst = max(active, key=_eviction_score_bass)
                 to_remove.add(worst)
                 del active[worst]
         else:

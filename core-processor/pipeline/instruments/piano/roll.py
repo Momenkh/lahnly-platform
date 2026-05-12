@@ -80,7 +80,8 @@ def generate_piano_roll(
         ax        = axes[sec_idx][0]
         t_start   = sec_idx * section_s
         t_end     = t_start + section_s
-        sec_notes = [n for n in mapped_notes if t_start <= n["start"] < t_end]
+        sec_notes = [n for n in mapped_notes
+                     if n["start"] < t_end and n["start"] + n["duration"] > t_start]
 
         ax.set_facecolor("#1a1a2e")   # dark background for piano roll
 

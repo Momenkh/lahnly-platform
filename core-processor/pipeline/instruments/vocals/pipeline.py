@@ -88,6 +88,12 @@ def run_vocals_pipeline(args) -> None:
         skip_msg="[Stage 3V] Skipped — loading saved cleaned vocals notes",
     )
 
+    # ── Velocity Estimation (between Stage 3 and Stage 4) ────────────────────
+    if os.path.isfile(pitch_input):
+        from pipeline.shared.spectral import compute_velocity
+        cleaned_notes = compute_velocity(cleaned_notes, pitch_input)
+        print(f"[Velocity] Estimated velocity for {len(cleaned_notes)} vocals notes")
+
     # ── Stage 4: Tempo Detection & Quantization ───────────────────────────────
     pre_quant_notes = list(cleaned_notes)
 
@@ -209,4 +215,5 @@ def run_vocals_pipeline(args) -> None:
         else:
             print("[Score V] Could not compute score — stem or preview missing")
 
+    executor.print_summary("vocals")
     print("\nDone. All vocals outputs saved to: outputs/")

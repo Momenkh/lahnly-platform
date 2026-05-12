@@ -18,11 +18,29 @@ from pipeline.settings import (
     VOCALS_ISOLATION_ENABLED,
     VOCALS_ISOLATION_WINDOW_S,
     VOCALS_ISOLATION_MIN_TOTAL,
+    VOCALS_ISOLATION_PITCH_AWARE,
+    VOCALS_ISOLATION_MAX_INTERVAL_ST,
+    VOCALS_ISOLATION_MIN_NEIGHBORS,
     VOCALS_HIGH_PITCH_FLOOR_1,
     VOCALS_HIGH_PITCH_REDUCTION_1,
     VOCALS_HIGH_PITCH_FLOOR_2,
     VOCALS_HIGH_PITCH_REDUCTION_2,
     VOCALS_HIGH_PITCH_MIN_DUR_SCALE,
+    VOCALS_POLY_ROOT_PROTECTION,
+    VOCALS_POLY_HEIGHT_PENALTY_ST,
+    VOCALS_POLY_HEIGHT_PENALTY_COEF,
+    VOCALS_BPM_FAST_THRESHOLD_BPM,
+    VOCALS_BPM_FAST_SUBDIV,
+    HARMONIC_COHERENCE_ENABLED,
+    HARMONIC_CONF_OVERRIDE,
+    SPECTRAL_PRESENCE_ENABLED,
+    SPECTRAL_PRESENCE_MIN_ENERGY,
+    SPECTRAL_PRESENCE_CONF_OVERRIDE,
+    ATTACK_GATE_ENABLED,
+    ATTACK_GATE_PRE_WINDOW_S,
+    ATTACK_GATE_POST_WINDOW_S,
+    ATTACK_GATE_MIN_RATIO,
+    ATTACK_GATE_CONF_OVERRIDE,
 )
 
 
@@ -45,8 +63,15 @@ def clean_notes_vocals(raw_notes, vocals_mode="vocals_lead", save=True):
                               min(VOCALS_MERGE_GAP_CEILING_S, beat_s / VOCALS_MERGE_BEAT_DIVISOR)), 4)
     else:
         merge_gap = VOCALS_DEFAULT_MERGE_GAP_S
-    min_dur     = (round(max(VOCALS_BPM_MIN_DUR_CLAMP_MIN_S, min(VOCALS_BPM_MIN_DUR_CLAMP_MAX_S, 60.0 / (bpm * bpm_subdiv))), 4)
-                   if bpm else min_dur_fb)
+    if bpm:
+        eff_subdiv = VOCALS_BPM_FAST_SUBDIV if bpm >= VOCALS_BPM_FAST_THRESHOLD_BPM else bpm_subdiv
+        min_dur = round(
+            max(VOCALS_BPM_MIN_DUR_CLAMP_MIN_S,
+                min(VOCALS_BPM_MIN_DUR_CLAMP_MAX_S, 60.0 / (bpm * eff_subdiv))),
+            4,
+        )
+    else:
+        min_dur = min_dur_fb
 
     print(f"[Stage 3V] Cleaning {len(raw_notes)} raw notes  (mode: {vocals_mode})")
     print(f"[Stage 3V] stem_conf={stem_conf:.2f}  conf_thresh={conf_thresh}  "
@@ -94,10 +119,62 @@ def clean_notes_vocals(raw_notes, vocals_mode="vocals_lead", save=True):
 
     if VOCALS_ISOLATION_ENABLED:
         before = len(notes)
-        notes  = _filter_isolated_notes_vocals(notes, VOCALS_ISOLATION_WINDOW_S, VOCALS_ISOLATION_MIN_TOTAL)
+        if VOCALS_ISOLATION_PITCH_AWARE:
+            from pipeline.shared.spectral import filter_isolated_notes_pitch_aware
+            notes = filter_isolated_notes_pitch_aware(
+                notes,
+                window_s=VOCALS_ISOLATION_WINDOW_S,
+                min_neighbors=VOCALS_ISOLATION_MIN_NEIGHBORS,
+                max_interval_st=VOCALS_ISOLATION_MAX_INTERVAL_ST,
+            )
+        else:
+            notes = _filter_isolated_notes_vocals(notes, VOCALS_ISOLATION_WINDOW_S, VOCALS_ISOLATION_MIN_TOTAL)
         removed = before - len(notes)
         if removed:
             print(f"[Stage 3V] After isolation filter   : {len(notes):4d}  (removed {removed})")
+
+    # Spectral gates — pitch-specific ghost note removal
+    from pipeline.shared.separation import get_stem_path_for
+    _stem = get_stem_path_for("vocals")
+    if os.path.isfile(_stem):
+        from pipeline.shared.spectral import (
+            compute_stem_cqt,
+            check_harmonic_coherence,
+            spectral_presence_gate,
+            attack_envelope_gate,
+        )
+        import librosa as _librosa
+        _cqt, _sr, _hop = compute_stem_cqt(_stem)
+        _stem_audio, _sr2 = _librosa.load(_stem, sr=22050, mono=True)
+
+        if HARMONIC_COHERENCE_ENABLED:
+            before = len(notes)
+            notes  = check_harmonic_coherence(notes, _cqt, _sr, _hop,
+                                              dominance_ratio=2.5,
+                                              conf_override=HARMONIC_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3V] After harmonic coherence : {len(notes):4d}  (removed {removed} overtones)")
+
+        if SPECTRAL_PRESENCE_ENABLED:
+            before = len(notes)
+            notes  = spectral_presence_gate(notes, _cqt, _sr, _hop,
+                                            min_energy=SPECTRAL_PRESENCE_MIN_ENERGY,
+                                            conf_override=SPECTRAL_PRESENCE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3V] After spectral presence  : {len(notes):4d}  (removed {removed} absent pitches)")
+
+        if ATTACK_GATE_ENABLED:
+            before = len(notes)
+            notes  = attack_envelope_gate(notes, _stem_audio, _sr2,
+                                          pre_window_s=ATTACK_GATE_PRE_WINDOW_S,
+                                          post_window_s=ATTACK_GATE_POST_WINDOW_S,
+                                          min_ratio=ATTACK_GATE_MIN_RATIO,
+                                          conf_override=ATTACK_GATE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3V] After attack gate        : {len(notes):4d}  (removed {removed} no-ramp notes)")
 
     before = len(notes); notes = _limit_polyphony(notes, max_poly)
     print(f"[Stage 3V] After polyphony limit    : {len(notes):4d}  (removed {before - len(notes)})")
@@ -233,12 +310,23 @@ def _limit_polyphony(notes, max_poly):
         events += [(n["start"], 0, i), (n["start"] + n["duration"], 1, i)]
     events.sort(key=lambda e: (e[0], e[1]))
     active = {}; to_remove = set()
+
+    def _eviction_score(idx):
+        note    = active[idx]
+        conf    = float(note.get("confidence", 0.0))
+        pitches = [active[j]["pitch"] for j in active]
+        is_lowest  = note["pitch"] == min(pitches)
+        root_bonus = 0.5 if (VOCALS_POLY_ROOT_PROTECTION and is_lowest) else 0.0
+        median_p   = sorted(pitches)[len(pitches) // 2]
+        over       = max(0, note["pitch"] - median_p - VOCALS_POLY_HEIGHT_PENALTY_ST)
+        return (1.0 - conf) + over * VOCALS_POLY_HEIGHT_PENALTY_COEF - root_bonus
+
     for _, et, idx in events:
         if idx in to_remove: continue
         if et == 0:
             active[idx] = notes[idx]
             while len(active) > max_poly:
-                worst = min(active, key=lambda i: (active[i]["confidence"], -active[i]["pitch"]))
+                worst = max(active, key=_eviction_score)
                 to_remove.add(worst); del active[worst]
         else:
             active.pop(idx, None)

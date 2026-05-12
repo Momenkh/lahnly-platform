@@ -166,4 +166,5 @@ def run_drums_pipeline(args) -> None:
         else:
             print("[Score D] Could not compute score — stem missing")
 
+    executor.print_summary("drums")
     print("\nDone. All drums outputs saved to: outputs/")

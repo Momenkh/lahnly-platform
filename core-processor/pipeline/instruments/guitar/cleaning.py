@@ -4,15 +4,17 @@ Input:  raw notes [{pitch, start, duration, confidence}]
 Output: cleaned notes, saved to outputs/03_cleaned_notes.json
 
 Filters applied in order:
-  1. Duration filter      — drop notes shorter than min_duration (type-dependent)
-  2. Confidence filter    — drop notes below adaptive threshold (scales with stem quality
+  1. Confidence filter    — drop notes below adaptive threshold (scales with stem quality
                             AND guitar type — lead solos rate lower confidence than chords)
-  3. Bass filter          — stricter confidence gate for notes below C2 (MIDI 36)
+  2. Bass filter          — stricter confidence gate for notes below C2 (MIDI 36)
                             (relaxed when htdemucs_6s dedicated guitar stem was used)
-  4. Bend detection       — consecutive notes within 2 semitones over a short gap are
+  3. Bend detection       — consecutive notes within 2 semitones over a short gap are
                             merged into one note at the lower pitch (guitar bends/vibrato)
-  5. Merge nearby         — merge same-pitch notes with gaps smaller than merge_gap
+  4. Merge nearby         — merge same-pitch notes with gaps smaller than merge_gap
                             (merge_gap scales with tempo when available)
+  5. Duration filter      — drop notes shorter than min_duration (type-dependent).
+                            Runs AFTER merge so short fragments combined into a full
+                            note survive (e.g. 3×50ms → 150ms passes a 77ms gate).
   6. Polyphony limit      — keep at most N simultaneous notes (type-dependent):
                               lead = 3, acoustic = 5, rhythm = 6
                             evicts by lowest confidence AND highest pitch (overtones)
@@ -41,12 +43,15 @@ from pipeline.settings import (
     CLEANING_BASS_CUTOFF_MIDI,
     CLEANING_BASS_CONF_DEDICATED_STEM,
     CLEANING_BASS_CONF_NONDEDICATED_STEM,
+    CLEANING_LOW_STRING_CUTOFF_MIDI,
+    CLEANING_LOW_STRING_CONF_GATE,
     CLEANING_DEFAULT_MERGE_GAP_S,
     CLEANING_MERGE_BEAT_DIVISOR,
     CLEANING_MERGE_GAP_FLOOR_S,
     CLEANING_MERGE_GAP_CEILING_S,
     CLEANING_BEND_MAX_SEMITONES,
     CLEANING_BEND_MAX_GAP_S,
+    CLEANING_BEND_MIN_FIRST_NOTE_S,
     CLEANING_TYPE_PARAMS,
     CLEANING_KEY_CONFIDENCE_CUTOFF,
     CLEANING_BPM_MIN_DUR_CLAMP_MIN_S,
@@ -70,6 +75,25 @@ from pipeline.settings import (
     CLEANING_ISOLATION_ENABLED,
     CLEANING_ISOLATION_WINDOW_S,
     CLEANING_ISOLATION_MIN_TOTAL,
+    CLEANING_ISOLATION_PITCH_AWARE,
+    CLEANING_ISOLATION_MAX_INTERVAL_ST,
+    CLEANING_POLY_ROOT_PROTECTION,
+    CLEANING_POLY_HEIGHT_PENALTY_ST,
+    CLEANING_POLY_HEIGHT_PENALTY_COEF,
+    CLEANING_BPM_FAST_THRESHOLD_BPM,
+    CLEANING_BPM_FAST_LEAD_SUBDIV,
+    CLEANING_BPM_FAST_RHYTHM_SUBDIV,
+    HARMONIC_COHERENCE_ENABLED,
+    HARMONIC_DOMINANCE_RATIO,
+    HARMONIC_CONF_OVERRIDE,
+    SPECTRAL_PRESENCE_ENABLED,
+    SPECTRAL_PRESENCE_MIN_ENERGY,
+    SPECTRAL_PRESENCE_CONF_OVERRIDE,
+    GUITAR_ATTACK_GATE_ENABLED,
+    ATTACK_GATE_PRE_WINDOW_S,
+    ATTACK_GATE_POST_WINDOW_S,
+    ATTACK_GATE_MIN_RATIO,
+    ATTACK_GATE_CONF_OVERRIDE,
 )
 
 VALID_GUITAR_TYPES = list(CLEANING_TYPE_PARAMS.keys())
@@ -120,9 +144,14 @@ def clean_notes(
         merge_gap = CLEANING_DEFAULT_MERGE_GAP_S
 
     # Adaptive min duration: beat / bpm_subdiv, clamped to a sensible range.
-    # Falls back to the fixed value from CLEANING_TYPE_PARAMS when BPM is unknown.
+    # At fast BPM (≥ FAST_THRESHOLD), use a finer subdivision so fast runs of
+    # 16th/32nd notes are not deleted.  Falls back to fixed value when BPM unknown.
     if bpm:
-        bpm_min_dur = 60.0 / (bpm * bpm_subdiv)
+        is_lead      = guitar_role == "lead"
+        eff_subdiv   = bpm_subdiv
+        if bpm >= CLEANING_BPM_FAST_THRESHOLD_BPM:
+            eff_subdiv = CLEANING_BPM_FAST_LEAD_SUBDIV if is_lead else CLEANING_BPM_FAST_RHYTHM_SUBDIV
+        bpm_min_dur = 60.0 / (bpm * eff_subdiv)
         min_dur = round(
             max(CLEANING_BPM_MIN_DUR_CLAMP_MIN_S,
                 min(CLEANING_BPM_MIN_DUR_CLAMP_MAX_S, bpm_min_dur)),
@@ -149,16 +178,8 @@ def clean_notes(
                                            thresh=CLEANING_STEM_GATE_THRESH)
         print(f"[Stage 3] After stem energy gate   : {len(notes):4d}  (removed {before - len(notes)})")
 
-    # 1. Duration filter (high notes get a scaled-down min_dur — they're real but shorter)
-    before = len(notes)
-    def _eff_min_dur(pitch):
-        if pitch >= CLEANING_HIGH_PITCH_FLOOR_1:
-            return min_dur * CLEANING_HIGH_PITCH_MIN_DUR_SCALE
-        return min_dur
-    notes  = [n for n in notes if n["duration"] >= _eff_min_dur(n["pitch"])]
-    print(f"[Stage 3] After duration filter    : {len(notes):4d}  (removed {before - len(notes)})")
-
-    # 2. Adaptive confidence filter (two-tier: Tier1 MIDI>=69 -0.040, Tier2 MIDI>=84 -0.075)
+    # 1. Adaptive confidence filter (two-tier: Tier1 MIDI>=69 -0.040, Tier2 MIDI>=84 -0.075)
+    #    Run BEFORE duration filter so merged fragments aren't pre-killed as too short.
     def _eff_conf_thresh(pitch):
         if pitch >= CLEANING_HIGH_PITCH_FLOOR_2:
             return max(0.0, conf_thresh - CLEANING_HIGH_PITCH_REDUCTION_2)
@@ -171,7 +192,7 @@ def clean_notes(
           f"  [gate: {conf_thresh} / tier1: {_eff_conf_thresh(CLEANING_HIGH_PITCH_FLOOR_1):.3f}"
           f" / tier2: {_eff_conf_thresh(CLEANING_HIGH_PITCH_FLOOR_2):.3f}]")
 
-    # 3. Bass filter
+    # 2. Bass filter (sub-C2 bleed)
     before = len(notes)
     notes  = [
         n for n in notes
@@ -179,19 +200,47 @@ def clean_notes(
     ]
     print(f"[Stage 3] After bass filter        : {len(notes):4d}  (removed {before - len(notes)})")
 
-    # 4. Bend detection — merge semitone-adjacent consecutive notes
-    #    Only applied for lead role or acoustic type; rhythm chords rarely bend
-    if guitar_role == "lead" or guitar_type == "acoustic":
+    # 2b. Low-string gate — A/D/E string range (MIDI < G3) requires higher confidence.
+    #     Body resonance and sympathetic vibration in this range score conf 0.20-0.49;
+    #     intentional low bass lines score ≥ 0.55.
+    before = len(notes)
+    notes  = [
+        n for n in notes
+        if n["pitch"] >= CLEANING_LOW_STRING_CUTOFF_MIDI
+        or n["confidence"] >= CLEANING_LOW_STRING_CONF_GATE
+    ]
+    removed = before - len(notes)
+    if removed:
+        print(f"[Stage 3] After low-string gate    : {len(notes):4d}  (removed {removed})")
+
+    # 3. Bend detection — merge semitone-adjacent consecutive notes.
+    #    Only for electric lead (clean/distorted): bends are common on electric and
+    #    basic-pitch spreads them into 2 adjacent-pitch detections.
+    #    Acoustic is EXCLUDED: bends are rare on acoustic, and its legato
+    #    hammer-on runs (1-2 semitone steps, 0ms gap) are indistinguishable from
+    #    bends — enabling this for acoustic destroys entire melodic phrases.
+    if guitar_role == "lead" and guitar_type in ("clean", "distorted"):
         before = len(notes)
         notes  = _merge_bends(notes,
                                max_semitones=CLEANING_BEND_MAX_SEMITONES,
-                               max_gap_s=CLEANING_BEND_MAX_GAP_S)
+                               max_gap_s=CLEANING_BEND_MAX_GAP_S,
+                               min_first_note_s=CLEANING_BEND_MIN_FIRST_NOTE_S)
         print(f"[Stage 3] After bend merge         : {len(notes):4d}  (merged  {before - len(notes)})")
 
-    # 5. Merge nearby same-pitch notes
+    # 4. Merge nearby same-pitch notes
     before = len(notes)
     notes  = _merge_nearby(notes, gap_threshold=merge_gap, merge_ratio=merge_ratio)
     print(f"[Stage 3] After merging nearby     : {len(notes):4d}  (merged  {before - len(notes)})")
+
+    # 5. Duration filter — applied AFTER merge so fragments combined into full notes
+    #    survive. A 3×50ms fragment that merges into 150ms is now judged as 150ms.
+    def _eff_min_dur(pitch):
+        if pitch >= CLEANING_HIGH_PITCH_FLOOR_1:
+            return min_dur * CLEANING_HIGH_PITCH_MIN_DUR_SCALE
+        return min_dur
+    before = len(notes)
+    notes  = [n for n in notes if n["duration"] >= _eff_min_dur(n["pitch"])]
+    print(f"[Stage 3] After duration filter    : {len(notes):4d}  (removed {before - len(notes)})")
 
     # 5b. Local pitch context filter
     local_max_dev = CLEANING_LOCAL_PITCH_MAX_DEV.get(mode_key)
@@ -207,15 +256,67 @@ def clean_notes(
         if removed:
             print(f"[Stage 3] After local pitch filter : {len(notes):4d}  (removed {removed})")
 
-    # 6. Ghost note isolation filter
+    # 6. Ghost note isolation filter (pitch-aware upgrade)
     if CLEANING_ISOLATION_ENABLED:
         before = len(notes)
-        notes  = _filter_isolated_notes(notes, CLEANING_ISOLATION_WINDOW_S, CLEANING_ISOLATION_MIN_TOTAL)
+        if CLEANING_ISOLATION_PITCH_AWARE:
+            from pipeline.shared.spectral import filter_isolated_notes_pitch_aware
+            notes = filter_isolated_notes_pitch_aware(
+                notes,
+                window_s=CLEANING_ISOLATION_WINDOW_S,
+                min_neighbors=2,
+                max_interval_st=CLEANING_ISOLATION_MAX_INTERVAL_ST,
+            )
+        else:
+            notes = _filter_isolated_notes(notes, CLEANING_ISOLATION_WINDOW_S, CLEANING_ISOLATION_MIN_TOTAL)
         removed = before - len(notes)
         if removed:
             print(f"[Stage 3] After isolation filter   : {len(notes):4d}  (removed {removed})")
 
-    # 7. Polyphony limit (confidence + fret-aware)
+    # 6b. Spectral gates — pitch-specific ghost note removal using stem CQT
+    from pipeline.shared.separation import get_stem_path
+    _stem = get_stem_path()
+    if os.path.isfile(_stem):
+        from pipeline.shared.spectral import (
+            compute_stem_cqt,
+            check_harmonic_coherence,
+            spectral_presence_gate,
+            attack_envelope_gate,
+        )
+        import librosa as _librosa
+        _cqt, _sr, _hop = compute_stem_cqt(_stem)
+        _stem_audio, _sr2 = _librosa.load(_stem, sr=22050, mono=True)
+
+        if HARMONIC_COHERENCE_ENABLED:
+            before = len(notes)
+            notes  = check_harmonic_coherence(notes, _cqt, _sr, _hop,
+                                              dominance_ratio=HARMONIC_DOMINANCE_RATIO,
+                                              conf_override=HARMONIC_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3] After harmonic coherence : {len(notes):4d}  (removed {removed} overtones)")
+
+        if SPECTRAL_PRESENCE_ENABLED:
+            before = len(notes)
+            notes  = spectral_presence_gate(notes, _cqt, _sr, _hop,
+                                            min_energy=SPECTRAL_PRESENCE_MIN_ENERGY,
+                                            conf_override=SPECTRAL_PRESENCE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3] After spectral presence  : {len(notes):4d}  (removed {removed} absent pitches)")
+
+        if GUITAR_ATTACK_GATE_ENABLED:
+            before = len(notes)
+            notes  = attack_envelope_gate(notes, _stem_audio, _sr2,
+                                          pre_window_s=ATTACK_GATE_PRE_WINDOW_S,
+                                          post_window_s=ATTACK_GATE_POST_WINDOW_S,
+                                          min_ratio=ATTACK_GATE_MIN_RATIO,
+                                          conf_override=ATTACK_GATE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3] After attack gate        : {len(notes):4d}  (removed {removed} no-ramp notes)")
+
+    # 7. Polyphony limit (smart eviction — protects chord root)
     before = len(notes)
     notes  = _limit_polyphony(notes, max_poly=max_poly)
     print(f"[Stage 3] After polyphony limit    : {len(notes):4d}  (removed {before - len(notes)})")
@@ -439,13 +540,18 @@ def _merge_bends(
     notes: list[dict],
     max_semitones: int = CLEANING_BEND_MAX_SEMITONES,
     max_gap_s: float = CLEANING_BEND_MAX_GAP_S,
+    min_first_note_s: float = CLEANING_BEND_MIN_FIRST_NOTE_S,
 ) -> list[dict]:
     """
     Detect and merge guitar bends / vibrato.
 
-    A bend sounds like two consecutive notes close in pitch with a tiny gap.
-    When two notes are within max_semitones of each other AND the gap between
-    them is <= max_gap_s, they are merged into a single note:
+    A bend shows up as two nearly-adjacent notes close in pitch (the model
+    detects the pre-bend pitch then the bent pitch).  Conditions to merge:
+      - gap between the two notes <= max_gap_s  (tight — true bends are ~0ms apart)
+      - pitch distance == 1 or 2 semitones
+      - first note duration >= min_first_note_s  (a 30ms note can't be a bend)
+
+    Result:
       - pitch  = lower of the two (the fretted note before the bend)
       - start  = earlier start
       - duration = span from first start to last end
@@ -466,7 +572,9 @@ def _merge_bends(
         gap     = nxt["start"] - cur_end
         semitone_dist = abs(nxt["pitch"] - cur["pitch"])
 
-        if gap <= max_gap_s and 1 <= semitone_dist <= max_semitones:
+        if (gap <= max_gap_s
+                and 1 <= semitone_dist <= max_semitones
+                and cur["duration"] >= min_first_note_s):
             # Merge: keep lower pitch, extend duration, take max confidence
             new_end = max(cur_end, nxt["start"] + nxt["duration"])
             merged[-1] = {
@@ -500,7 +608,12 @@ def _filter_isolated_notes(
 def _limit_polyphony(notes: list[dict], max_poly: int) -> list[dict]:
     """
     Sweep through time. Whenever >max_poly notes are simultaneously active,
-    evict by lowest confidence first, then by highest pitch (overtones live high).
+    evict the note with the highest eviction score.
+
+    Smart eviction (CLEANING_POLY_ROOT_PROTECTION=True):
+      - Protects the lowest-pitch note in any cluster (likely the chord root).
+      - Penalises notes far above the cluster median (likely overtones).
+    Legacy fallback: lowest confidence first, then highest pitch.
     """
     if not notes:
         return notes
@@ -514,16 +627,24 @@ def _limit_polyphony(notes: list[dict], max_poly: int) -> list[dict]:
     active    = {}
     to_remove = set()
 
+    def _eviction_score(idx):
+        note   = active[idx]
+        conf   = float(note.get("confidence", 0.0))
+        pitches = [active[j]["pitch"] for j in active]
+        is_lowest = note["pitch"] == min(pitches)
+        root_bonus = 0.5 if (CLEANING_POLY_ROOT_PROTECTION and is_lowest) else 0.0
+        median_p   = sorted(pitches)[len(pitches) // 2]
+        over       = max(0, note["pitch"] - median_p - CLEANING_POLY_HEIGHT_PENALTY_ST)
+        height_pen = over * CLEANING_POLY_HEIGHT_PENALTY_COEF
+        return (1.0 - conf) + height_pen - root_bonus
+
     for _time, event_type, idx in events:
         if idx in to_remove:
             continue
         if event_type == 0:
             active[idx] = notes[idx]
             while len(active) > max_poly:
-                worst = min(active, key=lambda i: (
-                    active[i]["confidence"],
-                    -active[i]["pitch"],
-                ))
+                worst = max(active, key=_eviction_score)
                 to_remove.add(worst)
                 del active[worst]
         else:

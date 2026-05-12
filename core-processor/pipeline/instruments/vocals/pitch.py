@@ -21,6 +21,7 @@ from pipeline.settings import (
     VOCALS_CONF_WEIGHT_BASE, VOCALS_CONF_WEIGHT_CONFIRMED, VOCALS_CONF_WEIGHT_STRONG,
     VOCALS_PYIN_MIN_NOTE_DURATION_S,
     VOCALS_CREPE_ENABLED, VOCALS_CREPE_MODEL, VOCALS_CREPE_FMAX,
+    VOCALS_CREPE_FMAX_PER_MODE, VOCALS_HARMONY_BP_PRIMARY,
     VOCALS_CREPE_CONF_THRESHOLDS, VOCALS_CREPE_MIN_NOTE_S, VOCALS_CREPE_MAX_GAP_S,
     VOCALS_CREPE_PITCH_TOLERANCE, VOCALS_CREPE_REPET_ENABLED, VOCALS_CREPE_REPET_AUTO_THRESHOLD,
     VOCALS_SUSTAINED_BOOST_MIN_S,
@@ -59,28 +60,45 @@ def extract_pitches_vocals(
         print(f"[Stage 2V] Auto-enabling REPET-SIM (stem_confidence={stem_conf_v:.2f} < {VOCALS_CREPE_REPET_AUTO_THRESHOLD})")
     use_repet_final = VOCALS_CREPE_REPET_ENABLED or use_repet or auto_repet_v
 
-    if VOCALS_CREPE_ENABLED:
-        try:
-            notes = _extract_crepe_vocals(audio_path, vocals_mode,
-                                          repet=use_repet_final)
-        except ImportError:
-            print("[Stage 2V] torchcrepe not available — falling back to basic-pitch only")
-        except Exception as exc:
-            print(f"[Stage 2V] CREPE failed ({exc}) — falling back to basic-pitch only")
+    harmony_bp_primary = (vocals_mode == "vocals_harmony" and VOCALS_HARMONY_BP_PRIMARY)
 
-    if not notes:
-        # CREPE unavailable or produced nothing — use basic-pitch as primary
+    if harmony_bp_primary:
+        # Harmony mode: basic-pitch is primary (polyphonic → captures harmony lines)
+        print(f"[Stage 2V] Harmony mode: basic-pitch primary, CREPE booster")
         try:
             notes = _extract_basic_pitch_vocals(audio_path, vocals_mode)
         except ImportError:
             notes = _extract_pyin_vocals(audio_path)
-    elif VOCALS_CREPE_ENABLED:
-        # CREPE succeeded — use basic-pitch as secondary verification
-        try:
-            bp_notes = _extract_basic_pitch_vocals(audio_path, vocals_mode, save=False)
-            notes    = _merge_crepe_primary_bp_secondary(notes, bp_notes)
-        except Exception:
-            pass   # basic-pitch verification is best-effort; CREPE result stands
+        if notes and VOCALS_CREPE_ENABLED:
+            try:
+                crepe_notes = _extract_crepe_vocals(audio_path, vocals_mode, repet=use_repet_final)
+                notes = _merge_bp_primary_crepe_booster(notes, crepe_notes)
+            except Exception:
+                pass   # CREPE boost is best-effort; bp result stands
+    else:
+        # Lead mode (and harmony fallback): CREPE is primary
+        if VOCALS_CREPE_ENABLED:
+            try:
+                notes = _extract_crepe_vocals(audio_path, vocals_mode,
+                                              repet=use_repet_final)
+            except ImportError:
+                print("[Stage 2V] torchcrepe not available — falling back to basic-pitch only")
+            except Exception as exc:
+                print(f"[Stage 2V] CREPE failed ({exc}) — falling back to basic-pitch only")
+
+        if not notes:
+            # CREPE unavailable or produced nothing — use basic-pitch as primary
+            try:
+                notes = _extract_basic_pitch_vocals(audio_path, vocals_mode)
+            except ImportError:
+                notes = _extract_pyin_vocals(audio_path)
+        elif VOCALS_CREPE_ENABLED:
+            # CREPE succeeded — use basic-pitch as secondary verification
+            try:
+                bp_notes = _extract_basic_pitch_vocals(audio_path, vocals_mode, save=False)
+                notes    = _merge_crepe_primary_bp_secondary(notes, bp_notes)
+            except Exception:
+                pass   # basic-pitch verification is best-effort; CREPE result stands
 
     _apply_sustained_boost_vocals(notes, VOCALS_SUSTAINED_BOOST_MIN_S,
                                    VOCALS_SUSTAINED_BOOST_AMOUNT, VOCALS_SUSTAINED_BOOST_CAP)
@@ -96,6 +114,7 @@ def _extract_crepe_vocals(audio_path: str, vocals_mode: str, repet: bool = False
     import torch
 
     conf_thresh = VOCALS_CREPE_CONF_THRESHOLDS.get(vocals_mode, 0.65)
+    fmax        = VOCALS_CREPE_FMAX_PER_MODE.get(vocals_mode, VOCALS_CREPE_FMAX)
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
     if repet:
@@ -109,17 +128,18 @@ def _extract_crepe_vocals(audio_path: str, vocals_mode: str, repet: bool = False
 
     hop_length_samples = 256
     hop_s = hop_length_samples / sr
+    _crepe_device = "cuda" if torch.cuda.is_available() else "cpu"
     audio_tensor = torch.tensor(y[None], dtype=torch.float32)
 
     frequency, confidence = torchcrepe.predict(
         audio_tensor, sr,
         hop_length=hop_length_samples,
         fmin=VOCALS_HZ_MIN,
-        fmax=VOCALS_CREPE_FMAX,
+        fmax=fmax,
         model=VOCALS_CREPE_MODEL,
         return_periodicity=True,
         decoder=torchcrepe.decode.viterbi,
-        device="cpu",
+        device=_crepe_device,
     )
 
     freq_arr = frequency.squeeze(0).numpy()
@@ -255,6 +275,36 @@ def _extract_pyin_vocals(audio_path: str) -> list[dict]:
     notes.sort(key=lambda n: n["start"])
     print(f"[Stage 2V] pyin: {len(notes)} notes")
     return notes
+
+
+def _merge_bp_primary_crepe_booster(
+    bp_notes: list[dict], crepe_notes: list[dict]
+) -> list[dict]:
+    """
+    Harmony mode merge: basic-pitch is the source of truth (polyphonic).
+    CREPE is monophonic — it only boosts confidence of bp notes it agrees with.
+    CREPE-only notes are NOT added (they would be the dominant pitch, already in bp).
+    """
+    if not crepe_notes:
+        return bp_notes
+
+    out = [dict(n) for n in bp_notes]
+    boosted = 0
+
+    for cn in crepe_notes:
+        c_s, c_e, c_p = cn["start"], cn["start"] + cn["duration"], cn["pitch"]
+        for note in out:
+            n_e = note["start"] + note["duration"]
+            overlap = max(0.0, min(c_e, n_e) - max(c_s, note["start"]))
+            if overlap > 0 and abs(note["pitch"] - c_p) <= VOCALS_CREPE_PITCH_TOLERANCE:
+                if cn["confidence"] > note["confidence"]:
+                    note["confidence"] = round(cn["confidence"], 4)
+                    boosted += 1
+                break
+
+    out.sort(key=lambda n: n["start"])
+    print(f"[Stage 2V] Merge: bp primary + CREPE booster: {boosted} notes boosted = {len(out)} total")
+    return out
 
 
 def _merge_crepe_primary_bp_secondary(

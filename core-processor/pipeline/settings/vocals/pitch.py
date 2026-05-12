@@ -22,6 +22,15 @@ Two modes (detected automatically):
 VOCALS_CREPE_ENABLED    = True
 VOCALS_CREPE_MODEL      = "tiny"
 VOCALS_CREPE_FMAX       = 1400.0   # Hz — extended from 1200 to capture soprano top (C6 = 1047Hz, C#6 = 1109Hz)
+# Per-mode ceiling: harmony can reach slightly higher than lead
+VOCALS_CREPE_FMAX_PER_MODE = {
+    "vocals_lead":    1200.0,   # typical lead vocal ceiling
+    "vocals_harmony": 1400.0,   # harmonies can reach higher
+}
+
+# Harmony mode uses basic-pitch as primary (polyphonic → captures harmony lines)
+# and CREPE as a confidence booster only. Lead mode keeps CREPE as primary.
+VOCALS_HARMONY_BP_PRIMARY = True
 VOCALS_CREPE_CONF_THRESHOLDS = {
     "vocals_lead":    0.65,   # main vocal — CREPE scores well on clean voice
     "vocals_harmony": 0.60,   # harmony stems have more bleed → lower threshold
@@ -34,9 +43,14 @@ VOCALS_CREPE_REPET_AUTO_THRESHOLD = 0.55   # auto-enable when stem_confidence < 
 
 # ── basic-pitch settings (secondary / verification pass) ─────────────────────
 VOCALS_MULTI_PASS_CONFIGS = {
-    #                              base pass              strict pass
-    "vocals_lead":    [(0.35, 0.25, 60),    (0.52, 0.40,  90)],
-    "vocals_harmony": [(0.30, 0.20, 60),    (0.48, 0.36,  90)],
+    # vocals_lead: CREPE is primary extractor; basic-pitch supplements.
+    # Single pass — loose pass1 (frame=0.25) was below vocal overtone ceiling
+    # and added harmonic noise that CREPE/cleaning then had to undo.
+    # vocals_harmony: basic-pitch is primary (VOCALS_HARMONY_BP_PRIMARY).
+    # Keeps two passes since harmony lines are quieter and harder to detect,
+    # but pass1 tightened to (0.38, 0.28) to reduce overtone leakage.
+    "vocals_lead":    [(0.44, 0.32, 60)],                         # single pass
+    "vocals_harmony": [(0.38, 0.28, 60),    (0.52, 0.40,  90)],  # two passes (harmony lines quieter)
 }
 
 VOCALS_PITCH_THRESHOLDS = {

@@ -46,6 +46,17 @@ from pipeline.settings import (
     BASS_SUSTAINED_BOOST_MIN_S,
     BASS_SUSTAINED_BOOST_AMOUNT,
     BASS_SUSTAINED_BOOST_CAP,
+    BASS_HIGH_NOTE_RECOVERY_MIDI,
+    BASS_HIGH_NOTE_RECOVERY_HZ,
+    BASS_HIGH_NOTE_RECOVERY_ONSET,
+    BASS_HIGH_NOTE_RECOVERY_FRAME,
+    BASS_HIGH_NOTE_RECOVERY_MIN_MS,
+    BASS_HIGH_NOTE_RECOVERY_MIN_CONF,
+    BASS_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+    BASS_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+    BASS_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+    BASS_HIGH_NOTE_RECOVERY_PITCH_FULL,
+    BASS_HIGH_NOTE_RECOVERY_ONSET_GATE,
 )
 
 BP_FRAMES_PER_SEC = BP_SAMPLE_RATE / BP_HOP_LENGTH   # ~86.1 fps
@@ -154,6 +165,9 @@ def _extract_basic_pitch_bass(
     if before != len(notes):
         print(f"[Stage 2B] Stem energy gate: removed {before - len(notes)} ghost notes "
               f"({len(notes)} remaining)")
+
+    # High-note recovery: re-run at adaptive thresholds for upper-register bass (C3+)
+    notes = _recover_high_notes_bass(notes, model_output)
 
     # CREPE overlay — bass is monophonic, making it ideal for CREPE
     if BASS_CREPE_ENABLED:
@@ -363,6 +377,7 @@ def _extract_crepe_bass(audio_path: str, bass_style: str = "bass_fingered", use_
     hop_length_samples = 256
     hop_s = hop_length_samples / sr
 
+    _crepe_device = "cuda" if torch.cuda.is_available() else "cpu"
     audio_tensor = torch.tensor(y[None], dtype=torch.float32)
     frequency, confidence = torchcrepe.predict(
         audio_tensor,
@@ -373,7 +388,7 @@ def _extract_crepe_bass(audio_path: str, bass_style: str = "bass_fingered", use_
         model=BASS_CREPE_MODEL,
         return_periodicity=True,
         decoder=torchcrepe.decode.viterbi,
-        device="cpu",
+        device=_crepe_device,
     )
 
     freq_arr = frequency.squeeze(0).numpy()
@@ -539,6 +554,98 @@ def _finish_note(notes, pitch, start, end, probs):
         "duration":   round(end - start, 4),
         "confidence": round(float(np.mean(probs)) if probs else 0.0, 4),
     })
+
+
+def _adaptive_high_note_thresh_bass(
+    midi_pitch: int,
+    base_onset: float,
+    base_frame: float,
+    onset_floor: float,
+    frame_floor: float,
+    pitch_zero: int,
+    pitch_full: int,
+) -> tuple[float, float]:
+    """Scale detection thresholds linearly from base (at pitch_zero) to floor (at pitch_full)."""
+    excess = max(0, midi_pitch - pitch_zero)
+    scale  = max(0.0, 1.0 - excess / max(1, pitch_full - pitch_zero))
+    return max(onset_floor, base_onset * scale), max(frame_floor, base_frame * scale)
+
+
+def _recover_high_notes_bass(notes: list[dict], model_output) -> list[dict]:
+    """Recovery pass for upper-register bass (MIDI >= BASS_HIGH_NOTE_RECOVERY_MIDI)."""
+    from basic_pitch.inference import infer as bp_infer
+    import bisect
+
+    min_note_len = int(round(BASS_HIGH_NOTE_RECOVERY_MIN_MS / 1000 * (22050 / 512)))
+
+    try:
+        midi_data, _ = bp_infer.model_output_to_notes(
+            model_output,
+            onset_thresh=BASS_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+            frame_thresh=BASS_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+            min_note_len=min_note_len,
+            min_freq=BASS_HIGH_NOTE_RECOVERY_HZ,
+            max_freq=BASS_HZ_MAX,
+            melodia_trick=False,
+        )
+    except Exception as exc:
+        print(f"[Stage 2B] High-note recovery skipped ({exc})")
+        return notes
+
+    note_arr  = model_output.get("note")
+    onset_arr = model_output.get("onset")
+    existing  = sorted((n["pitch"], n["start"]) for n in notes)
+    added = 0
+
+    for instrument in midi_data.instruments:
+        for note in instrument.notes:
+            pitch = int(note.pitch)
+            if not (BASS_HIGH_NOTE_RECOVERY_MIDI <= pitch <= BASS_MIDI_MAX):
+                continue
+            start = round(float(note.start), 4)
+            lo = bisect.bisect_left(existing, (pitch, start - 0.080))
+            hi = bisect.bisect_right(existing, (pitch, start + 0.080))
+            if any(existing[i][0] == pitch for i in range(lo, hi)):
+                continue
+            conf = _frame_confidence(note_arr, note.start, note.end, pitch)
+            if conf < BASS_HIGH_NOTE_RECOVERY_MIN_CONF:
+                continue
+            # Onset gate
+            if onset_arr is not None:
+                pitch_idx   = pitch - BP_MIDI_OFFSET
+                onset_frame = int(start * BP_FRAMES_PER_SEC)
+                f_lo = max(0, onset_frame - 2)
+                f_hi = min(onset_arr.shape[0], onset_frame + 3)
+                if 0 <= pitch_idx < onset_arr.shape[1] and f_lo < f_hi:
+                    peak_onset = float(onset_arr[f_lo:f_hi, pitch_idx].max())
+                    if peak_onset < BASS_HIGH_NOTE_RECOVERY_ONSET_GATE and conf < 0.70:
+                        continue
+            # Adaptive confidence gate
+            _, adap_frame = _adaptive_high_note_thresh_bass(
+                pitch,
+                BASS_HIGH_NOTE_RECOVERY_ONSET,
+                BASS_HIGH_NOTE_RECOVERY_FRAME,
+                BASS_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+                BASS_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+                BASS_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+                BASS_HIGH_NOTE_RECOVERY_PITCH_FULL,
+            )
+            if conf < adap_frame:
+                continue
+            notes.append({
+                "pitch":      pitch,
+                "start":      start,
+                "duration":   round(float(note.end - note.start), 4),
+                "confidence": round(conf, 4),
+            })
+            existing.append((pitch, start))
+            existing.sort()
+            added += 1
+
+    if added:
+        notes.sort(key=lambda n: n["start"])
+        print(f"[Stage 2B] High-note recovery: added {added} notes (MIDI>={BASS_HIGH_NOTE_RECOVERY_MIDI})")
+    return notes
 
 
 def _apply_sustained_boost_bass(

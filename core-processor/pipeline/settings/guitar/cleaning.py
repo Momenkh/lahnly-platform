@@ -36,6 +36,17 @@ CLEANING_BASS_CUTOFF_MIDI            = 36     # C2 — below every guitar string
 CLEANING_BASS_CONF_DEDICATED_STEM    = 0.50   # for htdemucs_6s guitar stem
 CLEANING_BASS_CONF_NONDEDICATED_STEM = 0.75   # for generic "other" stem
 
+# ── Low-string gate ───────────────────────────────────────────────────────────
+# A second-tier gate for notes in the A/D/E string range (MIDI < G3 = 55).
+# Demucs guitar stem leaks body resonance and low-string sympathetic vibration;
+# basic-pitch detects these as low-pitch ghost notes with confidence 0.20-0.49.
+# Real intentional low-string notes (bass lines in fingerpicking, thumb bass)
+# consistently have confidence ≥ 0.55 and long durations.
+# Threshold = 0.55 leaves a clean separation: in Yumain o Leila, all 63 ghost
+# notes below MIDI 55 sat at conf ≤ 0.49 while all 33 real low notes were ≥ 0.56.
+CLEANING_LOW_STRING_CUTOFF_MIDI = 55    # G3 = open G string — notes below this
+CLEANING_LOW_STRING_CONF_GATE   = 0.55  # require higher confidence for low strings
+
 # ── Fragment merge ────────────────────────────────────────────────────────────
 # basic-pitch sometimes breaks one physical note into two detections separated
 # by a very short silence (e.g. at a fret-squeak or slight finger lift).
@@ -58,12 +69,19 @@ CLEANING_DEFAULT_MERGE_GAP_S = 0.04
 # At 60  BPM: beat=1.000s → gap=0.125s → clamped to 0.060s ceiling.
 CLEANING_MERGE_BEAT_DIVISOR  = 8      # beat / 8 = half a 16th note
 CLEANING_MERGE_GAP_FLOOR_S   = 0.020  # never narrower than 20ms
-CLEANING_MERGE_GAP_CEILING_S = 0.080  # hard cap — matches original behaviour at slow tempos
+CLEANING_MERGE_GAP_CEILING_S = 0.130  # raised: at 72 BPM beat/8=104ms was capped at 80ms
 
 # Bend / vibrato merge: notes within a few semitones that overlap or are very
 # close together are collapsed into a single note (the stronger one survives).
-CLEANING_BEND_MAX_SEMITONES = 2    # semitone tolerance for pitch proximity
-CLEANING_BEND_MAX_GAP_S     = 0.12 # maximum gap between the two notes (seconds)
+CLEANING_BEND_MAX_SEMITONES  = 2     # semitone tolerance for pitch proximity
+CLEANING_BEND_MAX_GAP_S      = 0.015 # max gap — tight so fast melody runs (gap=50ms)
+                                      # are NOT treated as bends. Genuine bends show as
+                                      # overlapping or nearly-adjacent detections (gap ~0).
+                                      # 0.12 was too wide: legato melody steps 1-2 st apart
+                                      # chain-collapsed entire phrases into single notes.
+CLEANING_BEND_MIN_FIRST_NOTE_S = 0.060 # first note must be at least this long to be a
+                                        # bend candidate — a 40ms note can't be a sustained
+                                        # bend; minimum is roughly a 32nd note at 120 BPM.
 
 # ── Per-mode cleaning parameters ─────────────────────────────────────────────
 # Keyed by "{guitar_type}_{guitar_role}" compound key.
@@ -80,12 +98,12 @@ CLEANING_BEND_MAX_GAP_S     = 0.12 # maximum gap between the two notes (seconds)
 #   merge_ratio      — ratio threshold for the secondary merge condition.
 CLEANING_TYPE_PARAMS = {
     #                       min_dur  conf_floor  stem_scale  max_poly  bpm_subdiv  merge
-    "acoustic_lead":    (0.040,   0.15,       0.25,       3,        12,         0.20),
-    "acoustic_rhythm":  (0.080,   0.18,       0.30,       5,         8,         0.15),
-    "clean_lead":       (0.040,   0.10,       0.16,       3,        12,         0.25),   # 3 allows double-stops and grace-note bends
-    "clean_rhythm":     (0.100,   0.17,       0.40,       6,         6,         0.10),
-    "distorted_lead":   (0.040,   0.12,       0.20,       3,        12,         0.25),   # tighter conf: HPSS + distortion still noisy
-    "distorted_rhythm": (0.100,   0.20,       0.45,       6,         6,         0.10),   # tighter conf: distortion raises harmonic floor
+    "acoustic_lead":    (0.040,   0.05,       0.25,       3,        12,         0.45),  # low floor: fingerpicking treble strings score conf 0.10-0.18 when bass strings dominate; spectral gate filters ghosts
+    "acoustic_rhythm":  (0.080,   0.18,       0.30,       5,         8,         0.25),  # raised: strummed chords fragment at slow tempos
+    "clean_lead":       (0.040,   0.10,       0.16,       3,        12,         0.45),  # raised: fingerpicking notes ring into detection gaps
+    "clean_rhythm":     (0.100,   0.17,       0.40,       6,         6,         0.20),  # raised: chord sustain creates detection dips
+    "distorted_lead":   (0.040,   0.12,       0.20,       3,        12,         0.45),  # raised: HPSS chopping causes more fragments
+    "distorted_rhythm": (0.100,   0.20,       0.45,       6,         6,         0.20),  # raised: same as clean_rhythm
 }
 
 # ── BPM-aware duration clamp ──────────────────────────────────────────────────
@@ -209,3 +227,38 @@ CLEANING_HIGH_PITCH_MIN_DUR_SCALE = 0.65  # high notes allowed 35% shorter durat
 CLEANING_ISOLATION_ENABLED   = True
 CLEANING_ISOLATION_WINDOW_S  = 1.000   # ±1s window — 500ms was too narrow for slow-tempo songs
 CLEANING_ISOLATION_MIN_TOTAL = 20      # skip filter when note count < this; 10 was too aggressive
+
+# ── Pitch-aware isolation filter (replaces legacy total-count isolation) ──────
+# The upgraded filter only counts neighbours within MAX_INTERVAL_ST semitones
+# as "close" neighbours — a ghost note surrounded by distant-pitch real notes
+# will fail this check even though it has many raw neighbours.
+CLEANING_ISOLATION_PITCH_AWARE     = True   # enable the pitch-aware version
+CLEANING_ISOLATION_MAX_INTERVAL_ST = 12     # guitar: one octave
+
+# ── Smart polyphony eviction ──────────────────────────────────────────────────
+# The original eviction picked lowest-confidence note first, which often evicted
+# the root/bass note of a chord (low notes have lower model confidence).
+# Smart eviction protects the lowest-pitch note in any simultaneous cluster
+# (most likely the chord root) and penalises notes far above the median pitch
+# (most likely overtones).
+CLEANING_POLY_ROOT_PROTECTION     = True
+CLEANING_POLY_HEIGHT_PENALTY_ST   = 12     # semitones above median before height penalty
+CLEANING_POLY_HEIGHT_PENALTY_COEF = 0.02   # confidence equivalent per semitone over threshold
+
+# ── Fast-BPM duration filter ──────────────────────────────────────────────────
+# At high BPM (≥ FAST_THRESHOLD), use a finer subdivision so fast runs of
+# 16th/32nd notes are not deleted by the duration filter.
+# At 150 BPM a 32nd note is 100ms; the standard subdiv=12 gives 33ms which
+# is fine for lead but subdiv=6 gives 67ms for rhythm — may delete 32nd notes.
+CLEANING_BPM_FAST_THRESHOLD_BPM = 150
+CLEANING_BPM_FAST_LEAD_SUBDIV   = 16    # allows 64th-note equivalents at fast BPM
+CLEANING_BPM_FAST_RHYTHM_SUBDIV = 8     # allows 32nd notes for rhythm at fast BPM
+
+# ── Attack gate override ──────────────────────────────────────────────────────
+# Disable the global attack gate for guitar. Guitar notes sustain 0.5-3 seconds,
+# so any note played while a previous string is still ringing has pre_rms ≈ the
+# prior note's decay amplitude → attack_rms / pre_rms ≈ 1.0-1.5, failing the
+# 1.8× threshold. Observed: attack gate removed 55-63% of surviving notes across
+# all tested songs (e.g. 1304 notes in Hotel California, 735 in Galbi Metlel Ward).
+# Harmonic coherence + spectral presence already handle ghost notes.
+GUITAR_ATTACK_GATE_ENABLED = False

@@ -21,10 +21,12 @@ Three playing styles, each with a 2-pass config (base → strict):
 # Each tuple: (onset_threshold, frame_threshold, min_note_ms)
 # Pass order: loosest (base) → strictest.
 BASS_MULTI_PASS_CONFIGS = {
-    #                           base pass              strict pass
-    "bass_fingered": [(0.20, 0.14, 80),    (0.40, 0.28, 120)],
-    "bass_picked":   [(0.25, 0.18, 60),    (0.45, 0.32, 100)],
-    "bass_slap":     [(0.30, 0.22, 50),    (0.50, 0.38,  80)],
+    # Bass is monophonic — single pass at a threshold above the harmonic floor.
+    # Old pass1 (frame≤0.22) sat below bass's overtone ceiling and flooded raw
+    # notes with 2nd/3rd harmonics, requiring heavy cleaning to undo.
+    "bass_fingered": [(0.32, 0.22, 80)],    # single pass — soft finger-plucks need moderate gate
+    "bass_picked":   [(0.36, 0.26, 60)],    # single pass — picked notes have cleaner onsets
+    "bass_slap":     [(0.40, 0.30, 50)],    # single pass — slap transients are strong; tight threshold ok
 }
 
 # Single-pass fallback thresholds (onset, frame, min_note_ms).
@@ -75,3 +77,20 @@ BASS_CREPE_REPET_AUTO_THRESHOLD = 0.55   # auto-enable REPET-SIM when stem_confi
 BASS_SUSTAINED_BOOST_MIN_S  = 0.200   # bass notes sustain longer than guitar
 BASS_SUSTAINED_BOOST_AMOUNT = 0.08
 BASS_SUSTAINED_BOOST_CAP    = 0.95
+
+# ── High-note recovery pass ───────────────────────────────────────────────────
+# Upper-register bass (C3+, MIDI 48+) is less common so basic-pitch underrates it.
+# Runs with adaptive thresholds on the already-computed model_output (no extra inference).
+BASS_HIGH_NOTE_RECOVERY_MIDI   = 48      # C3 — start of upper-register bass
+BASS_HIGH_NOTE_RECOVERY_HZ     = 130.81  # Hz equivalent of MIDI 48 (C3)
+BASS_HIGH_NOTE_RECOVERY_ONSET  = 0.30    # base onset threshold at MIDI 48
+BASS_HIGH_NOTE_RECOVERY_FRAME  = 0.24    # base frame threshold at MIDI 48
+BASS_HIGH_NOTE_RECOVERY_MIN_MS = 50      # bass notes are longer
+BASS_HIGH_NOTE_RECOVERY_MIN_CONF = 0.20  # global frame confidence floor
+
+# Adaptive scaling: decays from base (at MIDI 48) to floor (at MIDI 60)
+BASS_HIGH_NOTE_RECOVERY_ONSET_FLOOR = 0.12
+BASS_HIGH_NOTE_RECOVERY_FRAME_FLOOR = 0.08
+BASS_HIGH_NOTE_RECOVERY_PITCH_ZERO  = 48   # C3 — where scaling starts
+BASS_HIGH_NOTE_RECOVERY_PITCH_FULL  = 60   # C4 — floor reached here
+BASS_HIGH_NOTE_RECOVERY_ONSET_GATE  = 0.18  # min onset spike to confirm recovery

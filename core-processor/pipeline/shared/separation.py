@@ -352,11 +352,11 @@ def gate_notes_by_stem_energy_for(
         return notes
 
     try:
-        audio, sr = sf.read(stem_path, always_2d=True)
+        audio, sr = sf.read(stem_path, always_2d=True, dtype="float32")
     except Exception:
         return notes
 
-    mono        = audio.mean(axis=1).astype(np.float32)
+    mono        = audio.mean(axis=1, dtype=np.float32)
     win_samples = max(1, int(window_s * sr))
     n_samples   = len(mono)
     n_windows   = (n_samples + win_samples - 1) // win_samples
@@ -404,11 +404,11 @@ def gate_notes_by_stem_energy(
         return notes
 
     try:
-        audio, sr = sf.read(stem_path, always_2d=True)
+        audio, sr = sf.read(stem_path, always_2d=True, dtype="float32")
     except Exception:
         return notes
 
-    mono        = audio.mean(axis=1).astype(np.float32)
+    mono        = audio.mean(axis=1, dtype=np.float32)
     win_samples = max(1, int(window_s * sr))
     n_samples   = len(mono)
     n_windows   = (n_samples + win_samples - 1) // win_samples

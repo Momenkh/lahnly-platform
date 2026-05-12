@@ -20,7 +20,10 @@ from pipeline.settings import (
     AUDIO_SAMPLE_RATE,
     AUDIO_AMP_BASE,
     AUDIO_AMP_CONF_SCALE,
+    AUDIO_VEL_BASE,
+    AUDIO_VEL_SCALE,
     AUDIO_KS_DAMPING,
+    AUDIO_NOTE_TAIL_S,
 )
 
 
@@ -91,12 +94,18 @@ def synthesize_notes(notes: list[dict]) -> np.ndarray:
 
     for note in notes:
         freq = midi_to_hz(note["pitch"])
-        dur  = note["duration"]
-        conf = float(note.get("confidence", 0.5))
-        # Use a narrow amplitude range so all detected notes contribute equally
-        # to the chroma comparison regardless of confidence.  The buffer is
-        # peak-normalised after synthesis, so only relative amplitudes matter.
-        amp  = AUDIO_AMP_BASE + AUDIO_AMP_CONF_SCALE * max(conf, 0.75)
+        # Extend duration so the KS string rings past the detected boundary.
+        # basic-pitch reports "how long the model was confident", not acoustic ring time.
+        dur  = note["duration"] + AUDIO_NOTE_TAIL_S
+        # Use velocity if available (added by compute_velocity after Stage 3).
+        # Velocity provides real dynamics from the stem, making the synthesized
+        # preview match the stem's amplitude contour and improving CQT similarity.
+        if "velocity" in note:
+            vel = float(note["velocity"]) / 127.0
+            amp = AUDIO_VEL_BASE + AUDIO_VEL_SCALE * vel
+        else:
+            conf = float(note.get("confidence", 0.5))
+            amp  = AUDIO_AMP_BASE + AUDIO_AMP_CONF_SCALE * max(conf, 0.75)
 
         wave = _karplus_strong(freq, dur, amp, AUDIO_SAMPLE_RATE)
         if len(wave) == 0:

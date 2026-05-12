@@ -17,9 +17,14 @@ Two modes:
 # ── Multi-pass extraction ─────────────────────────────────────────────────────
 # Each tuple: (onset_threshold, frame_threshold, min_note_ms)
 PIANO_MULTI_PASS_CONFIGS = {
-    #                             base pass              strict pass
-    "piano_melody": [(0.30, 0.22, 50),     (0.50, 0.38,  80)],
-    "piano_chord":  [(0.40, 0.30, 60),     (0.58, 0.46, 100)],
+    # piano_melody is essentially monophonic (single melodic line) — single pass
+    # above the harmonic overtone ceiling avoids flooding with piano harmonics.
+    # piano_chord keeps two passes: genuine polyphony (both hands) benefits from
+    # the broader first sweep.  Pass1 tightened to (0.45, 0.34) — above the
+    # ~0.30 harmonic floor so overtones don't dominate before harmonic coherence
+    # check can run.
+    "piano_melody": [(0.40, 0.30, 50)],                          # single pass
+    "piano_chord":  [(0.45, 0.34, 60),    (0.58, 0.46, 100)],   # two passes (polyphonic)
 }
 
 # Single-pass fallback thresholds (onset, frame, min_note_ms).
@@ -49,10 +54,17 @@ PIANO_PYIN_MIN_NOTE_DURATION_S = 0.06
 # ── High-note recovery pass ───────────────────────────────────────────────────
 PIANO_HIGH_NOTE_RECOVERY_MIDI   = 72      # C5 — start earlier; piano range is wider
 PIANO_HIGH_NOTE_RECOVERY_HZ     = 523.25  # Hz equivalent of MIDI 72 (C5)
-PIANO_HIGH_NOTE_RECOVERY_ONSET  = 0.35
-PIANO_HIGH_NOTE_RECOVERY_FRAME  = 0.28
+PIANO_HIGH_NOTE_RECOVERY_ONSET  = 0.35    # base onset threshold at MIDI 72
+PIANO_HIGH_NOTE_RECOVERY_FRAME  = 0.28    # base frame threshold at MIDI 72
 PIANO_HIGH_NOTE_RECOVERY_MIN_MS = 25      # piano high notes can be very short
-PIANO_HIGH_NOTE_RECOVERY_MIN_CONF = 0.25
+PIANO_HIGH_NOTE_RECOVERY_MIN_CONF = 0.25  # global frame confidence floor
+
+# Adaptive threshold scaling: decays from base (at MIDI 72) to floor (at MIDI 96)
+PIANO_HIGH_NOTE_RECOVERY_ONSET_FLOOR = 0.10   # lighter floor — piano overtones are cleaner
+PIANO_HIGH_NOTE_RECOVERY_FRAME_FLOOR = 0.07
+PIANO_HIGH_NOTE_RECOVERY_PITCH_ZERO  = 72     # where scaling starts (C5)
+PIANO_HIGH_NOTE_RECOVERY_PITCH_FULL  = 96     # floor reached at C7
+PIANO_HIGH_NOTE_RECOVERY_ONSET_GATE  = 0.18   # lower than guitar — piano attacks are crisper
 
 # ── CREPE overlay ─────────────────────────────────────────────────────────────
 # CREPE is only useful for melody mode — chord mode has too many simultaneous

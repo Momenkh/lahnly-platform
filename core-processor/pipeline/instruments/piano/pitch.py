@@ -46,6 +46,11 @@ from pipeline.settings import (
     PIANO_HIGH_NOTE_RECOVERY_FRAME,
     PIANO_HIGH_NOTE_RECOVERY_MIN_MS,
     PIANO_HIGH_NOTE_RECOVERY_MIN_CONF,
+    PIANO_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+    PIANO_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+    PIANO_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+    PIANO_HIGH_NOTE_RECOVERY_PITCH_FULL,
+    PIANO_HIGH_NOTE_RECOVERY_ONSET_GATE,
 )
 
 BP_FRAMES_PER_SEC = BP_SAMPLE_RATE / BP_HOP_LENGTH
@@ -335,6 +340,7 @@ def _extract_crepe_piano(audio_path: str, piano_mode: str) -> list[dict]:
 
     hop_length_samples = 256
     hop_s = hop_length_samples / sr
+    _crepe_device = "cuda" if torch.cuda.is_available() else "cpu"
     audio_tensor = torch.tensor(y[None], dtype=torch.float32)
     frequency, confidence = torchcrepe.predict(
         audio_tensor, sr,
@@ -344,7 +350,7 @@ def _extract_crepe_piano(audio_path: str, piano_mode: str) -> list[dict]:
         model=PIANO_CREPE_MODEL,
         return_periodicity=True,
         decoder=torchcrepe.decode.viterbi,
-        device="cpu",
+        device=_crepe_device,
     )
 
     freq_arr = frequency.squeeze(0).numpy()
@@ -444,18 +450,34 @@ def _finish_note(notes, pitch, start, end, probs):
     })
 
 
+def _adaptive_high_note_thresh_piano(
+    midi_pitch: int,
+    base_onset: float,
+    base_frame: float,
+    onset_floor: float,
+    frame_floor: float,
+    pitch_zero: int,
+    pitch_full: int,
+) -> tuple[float, float]:
+    """Scale detection thresholds linearly from base (at pitch_zero) to floor (at pitch_full)."""
+    excess = max(0, midi_pitch - pitch_zero)
+    scale  = max(0.0, 1.0 - excess / max(1, pitch_full - pitch_zero))
+    return max(onset_floor, base_onset * scale), max(frame_floor, base_frame * scale)
+
+
 def _recover_high_notes_piano(notes: list[dict], model_output) -> list[dict]:
-    """Recovery pass for high piano notes (MIDI >= PIANO_HIGH_NOTE_RECOVERY_MIDI)."""
+    """Recovery pass for high piano notes — adaptive thresholds + onset gate."""
     from basic_pitch.inference import infer as bp_infer
     import bisect
 
     min_note_len = int(round(PIANO_HIGH_NOTE_RECOVERY_MIN_MS / 1000 * (22050 / 512)))
 
     try:
+        # Use floor thresholds to capture all candidates.
         midi_data, _ = bp_infer.model_output_to_notes(
             model_output,
-            onset_thresh=PIANO_HIGH_NOTE_RECOVERY_ONSET,
-            frame_thresh=PIANO_HIGH_NOTE_RECOVERY_FRAME,
+            onset_thresh=PIANO_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+            frame_thresh=PIANO_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
             min_note_len=min_note_len,
             min_freq=PIANO_HIGH_NOTE_RECOVERY_HZ,
             max_freq=PIANO_HZ_MAX,
@@ -465,8 +487,9 @@ def _recover_high_notes_piano(notes: list[dict], model_output) -> list[dict]:
         print(f"[Stage 2P] High-note recovery skipped ({exc})")
         return notes
 
-    note_arr = model_output.get("note")
-    existing = sorted((n["pitch"], n["start"]) for n in notes)
+    note_arr  = model_output.get("note")
+    onset_arr = model_output.get("onset")
+    existing  = sorted((n["pitch"], n["start"]) for n in notes)
     added = 0
 
     for instrument in midi_data.instruments:
@@ -481,6 +504,28 @@ def _recover_high_notes_piano(notes: list[dict], model_output) -> list[dict]:
                 continue
             conf = _frame_confidence(note_arr, note.start, note.end, pitch)
             if conf < PIANO_HIGH_NOTE_RECOVERY_MIN_CONF:
+                continue
+            # Onset gate: require an onset spike within ±2 frames of the note start
+            if onset_arr is not None:
+                pitch_idx   = pitch - BP_MIDI_OFFSET
+                onset_frame = int(start * BP_FRAMES_PER_SEC)
+                f_lo = max(0, onset_frame - 2)
+                f_hi = min(onset_arr.shape[0], onset_frame + 3)
+                if 0 <= pitch_idx < onset_arr.shape[1] and f_lo < f_hi:
+                    peak_onset = float(onset_arr[f_lo:f_hi, pitch_idx].max())
+                    if peak_onset < PIANO_HIGH_NOTE_RECOVERY_ONSET_GATE and conf < 0.70:
+                        continue
+            # Adaptive confidence gate: progressively lower for higher pitches
+            _, adap_frame = _adaptive_high_note_thresh_piano(
+                pitch,
+                PIANO_HIGH_NOTE_RECOVERY_ONSET,
+                PIANO_HIGH_NOTE_RECOVERY_FRAME,
+                PIANO_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+                PIANO_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+                PIANO_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+                PIANO_HIGH_NOTE_RECOVERY_PITCH_FULL,
+            )
+            if conf < adap_frame:
                 continue
             notes.append({
                 "pitch":      pitch,

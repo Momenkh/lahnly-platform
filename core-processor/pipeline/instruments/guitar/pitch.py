@@ -55,6 +55,7 @@ from pipeline.settings import (
     CREPE_REPET_ENABLED,
     CREPE_REPET_AUTO_THRESHOLD,
     CREPE_HOP_LENGTH,
+    CREPE_FMAX_PER_TYPE,
     PITCH_OCTAVE_ERROR_THRESHOLD_ST,
     PITCH_SUSTAINED_BOOST_MIN_S,
     PITCH_SUSTAINED_BOOST_AMOUNT,
@@ -65,6 +66,11 @@ from pipeline.settings import (
     PITCH_HIGH_NOTE_RECOVERY_FRAME,
     PITCH_HIGH_NOTE_RECOVERY_MIN_MS,
     PITCH_HIGH_NOTE_RECOVERY_MIN_CONF,
+    PITCH_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+    PITCH_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+    PITCH_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+    PITCH_HIGH_NOTE_RECOVERY_PITCH_FULL,
+    PITCH_HIGH_NOTE_RECOVERY_ONSET_GATE,
 )
 
 BP_FRAMES_PER_SEC = BP_SAMPLE_RATE / BP_HOP_LENGTH   # ~86.1 fps
@@ -103,7 +109,13 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "clean", guitar_rol
     from basic_pitch.inference import infer as bp_infer
     from basic_pitch import ICASSP_2022_MODEL_PATH
     from pipeline.shared.separation import load_stem_meta, gate_notes_by_stem_energy
-    from pipeline.settings import PITCH_DISTORTED_HPSS_MARGIN
+    from pipeline.settings import (
+        PITCH_DISTORTED_HPSS_MARGIN,
+        PITCH_DISTORTED_HPSS_MARGIN_WEAK,
+        PITCH_DISTORTED_HPSS_MARGIN_STRONG,
+        PITCH_DISTORTED_HPSS_STEM_THRESH_WEAK,
+        PITCH_DISTORTED_HPSS_STEM_THRESH_STRONG,
+    )
 
     stem_conf = load_stem_meta().get("stem_confidence", 0.5)
     mode_key  = f"{guitar_type}_{guitar_role}"
@@ -112,16 +124,27 @@ def _extract_basic_pitch(audio_path: str, guitar_type: str = "clean", guitar_rol
 
     # HPSS pre-processing for distorted guitar — isolate harmonic component
     # before basic-pitch so boosted distortion harmonics don't flood detections.
+    # Margin is adaptive: weak stems get more aggressive harmonic isolation.
     _hpss_tmp = None
     if guitar_type == "distorted":
         import librosa, tempfile, soundfile as sf
+        if stem_conf < PITCH_DISTORTED_HPSS_STEM_THRESH_WEAK:
+            hpss_margin = PITCH_DISTORTED_HPSS_MARGIN_WEAK
+        elif stem_conf > PITCH_DISTORTED_HPSS_STEM_THRESH_STRONG:
+            hpss_margin = PITCH_DISTORTED_HPSS_MARGIN_STRONG
+        else:
+            # Linear interpolation between weak and strong
+            t = ((stem_conf - PITCH_DISTORTED_HPSS_STEM_THRESH_WEAK)
+                 / (PITCH_DISTORTED_HPSS_STEM_THRESH_STRONG - PITCH_DISTORTED_HPSS_STEM_THRESH_WEAK))
+            hpss_margin = PITCH_DISTORTED_HPSS_MARGIN_WEAK + t * (
+                PITCH_DISTORTED_HPSS_MARGIN_STRONG - PITCH_DISTORTED_HPSS_MARGIN_WEAK)
         y, sr = librosa.load(audio_path, sr=None, mono=True)
-        y_harmonic, _ = librosa.effects.hpss(y, margin=PITCH_DISTORTED_HPSS_MARGIN)
+        y_harmonic, _ = librosa.effects.hpss(y, margin=hpss_margin)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         sf.write(tmp.name, y_harmonic, sr)
         audio_path_for_bp = tmp.name
         _hpss_tmp = tmp.name
-        print(f"[Stage 2] Distorted guitar: HPSS applied (harmonic component only)")
+        print(f"[Stage 2] Distorted guitar: HPSS applied (margin={hpss_margin:.2f}, stem_conf={stem_conf:.2f})")
     else:
         audio_path_for_bp = audio_path
 
@@ -473,6 +496,7 @@ def _extract_crepe(audio_path: str, midi_max: int, guitar_type: str = "clean", u
     import torch
 
     conf_thresh = CREPE_CONF_THRESHOLDS.get(guitar_type, CREPE_CONF_THRESHOLDS["clean"])
+    fmax        = CREPE_FMAX_PER_TYPE.get(guitar_type, CREPE_FMAX)
 
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
@@ -488,17 +512,18 @@ def _extract_crepe(audio_path: str, midi_max: int, guitar_type: str = "clean", u
     hop_length_samples = CREPE_HOP_LENGTH
     hop_s = hop_length_samples / sr
 
+    _crepe_device = "cuda" if torch.cuda.is_available() else "cpu"
     audio_tensor = torch.tensor(y[None], dtype=torch.float32)
     frequency, confidence = torchcrepe.predict(
         audio_tensor,
         sr,
         hop_length=hop_length_samples,
         fmin=GUITAR_HZ_MIN,
-        fmax=CREPE_FMAX,
+        fmax=fmax,
         model=CREPE_MODEL,
         return_periodicity=True,
         decoder=torchcrepe.decode.viterbi,
-        device="cpu",
+        device=_crepe_device,
     )
 
     freq_arr = frequency.squeeze(0).numpy()
@@ -728,12 +753,26 @@ def _finish_note(notes, pitch, start, end, probs):
 
 # ── High-note recovery pass ──────────────────────────────────────────────────
 
+def _adaptive_high_note_thresh(
+    midi_pitch: int,
+    base_onset: float,
+    base_frame: float,
+    onset_floor: float,
+    frame_floor: float,
+    pitch_zero: int,
+    pitch_full: int,
+) -> tuple[float, float]:
+    """Scale detection thresholds linearly from base (at pitch_zero) to floor (at pitch_full)."""
+    excess = max(0, midi_pitch - pitch_zero)
+    scale  = max(0.0, 1.0 - excess / max(1, pitch_full - pitch_zero))
+    return max(onset_floor, base_onset * scale), max(frame_floor, base_frame * scale)
+
+
 def _recover_high_notes(notes: list[dict], model_output, hz_max: float) -> list[dict]:
     """
-    Re-run model_output_to_notes at very low thresholds restricted to the high
-    register (>= PITCH_HIGH_NOTE_RECOVERY_HZ).  basic-pitch systematically
-    assigns lower confidence to high pitches because harmonics become sparse in
-    the upper CQT bins; this pass captures notes the main passes missed.
+    Re-run model_output_to_notes at floor thresholds restricted to the high register
+    (>= PITCH_HIGH_NOTE_RECOVERY_HZ), then apply adaptive per-pitch filtering and an
+    onset gate to suppress overtone false positives.
 
     Only ADDS notes not already present — never removes or modifies existing ones.
     """
@@ -746,10 +785,11 @@ def _recover_high_notes(notes: list[dict], model_output, hz_max: float) -> list[
     ))
 
     try:
+        # Use floor thresholds so all candidates reach the per-note filter below.
         midi_data, _ = bp_infer.model_output_to_notes(
             model_output,
-            onset_thresh=PITCH_HIGH_NOTE_RECOVERY_ONSET,
-            frame_thresh=PITCH_HIGH_NOTE_RECOVERY_FRAME,
+            onset_thresh=PITCH_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+            frame_thresh=PITCH_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
             min_note_len=min_note_len,
             min_freq=PITCH_HIGH_NOTE_RECOVERY_HZ,
             max_freq=hz_max,
@@ -759,10 +799,9 @@ def _recover_high_notes(notes: list[dict], model_output, hz_max: float) -> list[
         print(f"[Stage 2] High-note recovery skipped ({exc})")
         return notes
 
-    note_arr = model_output.get("note")
-
-    # Build lookup of existing notes by (pitch, start) for fast dedup
-    existing = sorted((n["pitch"], n["start"]) for n in notes)
+    note_arr  = model_output.get("note")
+    onset_arr = model_output.get("onset")
+    existing  = sorted((n["pitch"], n["start"]) for n in notes)
 
     added = 0
     for instrument in midi_data.instruments:
@@ -777,7 +816,30 @@ def _recover_high_notes(notes: list[dict], model_output, hz_max: float) -> list[
             if any(existing[i][0] == pitch for i in range(lo, hi)):
                 continue
             conf = _frame_confidence(note_arr, note.start, note.end, pitch)
+            # Global floor
             if conf < PITCH_HIGH_NOTE_RECOVERY_MIN_CONF:
+                continue
+            # Onset gate: require an onset spike in model_output["onset"] within ±2 frames
+            if onset_arr is not None:
+                pitch_idx   = pitch - BP_MIDI_OFFSET
+                onset_frame = int(start * BP_FRAMES_PER_SEC)
+                f_lo = max(0, onset_frame - 2)
+                f_hi = min(onset_arr.shape[0], onset_frame + 3)
+                if 0 <= pitch_idx < onset_arr.shape[1] and f_lo < f_hi:
+                    peak_onset = float(onset_arr[f_lo:f_hi, pitch_idx].max())
+                    if peak_onset < PITCH_HIGH_NOTE_RECOVERY_ONSET_GATE and conf < 0.70:
+                        continue  # no onset spike and not very high confidence → likely overtone
+            # Adaptive confidence gate: progressively lower threshold for higher notes
+            _, adap_frame = _adaptive_high_note_thresh(
+                pitch,
+                PITCH_HIGH_NOTE_RECOVERY_ONSET,
+                PITCH_HIGH_NOTE_RECOVERY_FRAME,
+                PITCH_HIGH_NOTE_RECOVERY_ONSET_FLOOR,
+                PITCH_HIGH_NOTE_RECOVERY_FRAME_FLOOR,
+                PITCH_HIGH_NOTE_RECOVERY_PITCH_ZERO,
+                PITCH_HIGH_NOTE_RECOVERY_PITCH_FULL,
+            )
+            if conf < adap_frame:
                 continue
             notes.append({
                 "pitch":      pitch,

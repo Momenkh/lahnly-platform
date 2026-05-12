@@ -79,3 +79,31 @@ BASS_STEM_GATE_THRESH  = 0.005
 BASS_ISOLATION_ENABLED   = True
 BASS_ISOLATION_WINDOW_S  = 1.000   # bass lines are sparser — wider window
 BASS_ISOLATION_MIN_TOTAL = 15      # higher than guitar default — bass lines are naturally sparser
+
+# Pitch-aware isolation: bass lines move in 4ths/5ths — cap at 7 semitones
+BASS_ISOLATION_PITCH_AWARE     = True
+BASS_ISOLATION_MAX_INTERVAL_ST = 7
+
+# ── Attack gate override ─────────────────────────────────────────────────────
+# Disable the global attack gate for bass. Fingered/picked bass notes sustain
+# into the next note's pre-window, making the attack_rms/pre_rms ratio ≈ 1.0
+# for ALL notes — the gate incorrectly removes 60%+ of real bass notes.
+# Spectral presence + harmonic coherence already guard against ghost notes.
+BASS_ATTACK_GATE_ENABLED = False
+
+# Smart polyphony eviction
+BASS_POLY_ROOT_PROTECTION     = True
+BASS_POLY_HEIGHT_PENALTY_ST   = 7
+BASS_POLY_HEIGHT_PENALTY_COEF = 0.03
+
+# Fast-BPM duration filter
+BASS_BPM_FAST_THRESHOLD_BPM = 150
+BASS_BPM_FAST_SUBDIV        = 12    # bass rarely plays 32nd notes; 12 = standard at fast BPM
+
+# ── Octave duplicate correction ───────────────────────────────────────────────
+# Bass almost never plays P and P-12 simultaneously. When note P (above C3) has
+# a note one octave below (P-12) within BASS_OCTAVE_DUP_WINDOW_S, the upper note
+# is almost certainly a phantom harmonic — shift it down.
+BASS_OCTAVE_DUP_ENABLED        = True
+BASS_OCTAVE_DUP_MIDI_THRESHOLD = 48     # C3 — only check notes above this
+BASS_OCTAVE_DUP_WINDOW_S       = 0.080  # ±80ms co-occurrence window

@@ -60,8 +60,12 @@ PITCH_THRESHOLDS = {
 
 # ── HPSS pre-processing for distorted guitar ──────────────────────────────────
 # librosa.effects.hpss margin: higher = more aggressive harmonic/percussive split.
-# 3.0 is a good balance — reduces distortion harmonics without removing fundamentals.
-PITCH_DISTORTED_HPSS_MARGIN = 3.0
+# Adaptive: weak stems (more noise) get a higher margin; strong stems get lighter touch.
+PITCH_DISTORTED_HPSS_MARGIN = 3.0   # legacy fallback (used when stem_conf unavailable)
+PITCH_DISTORTED_HPSS_MARGIN_WEAK    = 4.0   # margin when stem_conf < THRESH_WEAK
+PITCH_DISTORTED_HPSS_MARGIN_STRONG  = 2.5   # margin when stem_conf > THRESH_STRONG
+PITCH_DISTORTED_HPSS_STEM_THRESH_WEAK   = 0.40
+PITCH_DISTORTED_HPSS_STEM_THRESH_STRONG = 0.75
 
 # ── pyin fallback ─────────────────────────────────────────────────────────────
 # If basic-pitch is unavailable the pipeline falls back to librosa pyin
@@ -90,13 +94,16 @@ PITCH_PYIN_MIN_NOTE_DURATION_S = 0.06   # seconds
 # Distorted type gets slightly tighter thresholds: HPSS removes most distortion
 # harmonics but some residue remains above the clean-guitar harmonic ceiling.
 PITCH_MULTI_PASS_CONFIGS = {
-    #                           base pass              strict pass
-    "acoustic_lead":    [(0.40, 0.28, 40),    (0.55, 0.42, 80)],
+    # Lead modes use a SINGLE pass at the strict threshold — pass1's loose thresholds
+    # (onset<0.30, frame<0.25) sit below the harmonic overtone ceiling (~0.40 frame),
+    # flooding raw notes with ghost harmonics and making every downstream gate work
+    # overtime.  Single-voice lead lines don't need the broad first sweep.
+    "acoustic_lead":    [(0.42, 0.30, 40)],   # single pass — clean entry, good recall
     "acoustic_rhythm":  [(0.45, 0.32, 50),    (0.58, 0.45, 80)],
-    "clean_lead":       [(0.25, 0.20, 40),    (0.45, 0.35, 80)],
+    "clean_lead":       [(0.32, 0.26, 40)],   # single pass above harmonic ceiling
     "clean_rhythm":     [(0.50, 0.40, 60),    (0.62, 0.52, 80)],
-    "distorted_lead":   [(0.30, 0.25, 40),    (0.50, 0.40, 80)],   # tighter than clean_lead
-    "distorted_rhythm": [(0.52, 0.43, 60),    (0.65, 0.55, 80)],   # tighter than clean_rhythm
+    "distorted_lead":   [(0.38, 0.30, 40)],   # HPSS already removes most harmonics; one clean pass
+    "distorted_rhythm": [(0.52, 0.43, 60),    (0.65, 0.55, 80)],
 }
 
 # Maximum time between two notes of the same pitch for them to be considered
@@ -148,6 +155,12 @@ PITCH_CONF_WEIGHT_BASE      = 0.45   # only in the loosest pass — needs strong
 CREPE_ENABLED       = True
 CREPE_MODEL         = "tiny"
 CREPE_FMAX          = 1760.0   # Hz — safe ceiling; do NOT raise above 1975
+# Per-type ceiling: distortion adds inharmonic content above the fretboard range.
+CREPE_FMAX_PER_TYPE = {
+    "acoustic":  1174.0,   # D6 — top of practical acoustic range
+    "clean":     1760.0,   # A6 — top of electric clean
+    "distorted": 1320.0,   # E6 — above this distortion adds inharmonic content
+}
 CREPE_CONF_THRESHOLDS = {
     "acoustic":  0.72,
     "clean":     0.75,
@@ -177,10 +190,21 @@ PITCH_OCTAVE_ERROR_THRESHOLD_ST = 5
 # the graduated confidence gate in cleaning.
 PITCH_HIGH_NOTE_RECOVERY_MIDI   = 69      # A4 — recovery covers MIDI 69 and above
 PITCH_HIGH_NOTE_RECOVERY_HZ     = 440.0   # Hz equivalent of MIDI 69 (A4)
-PITCH_HIGH_NOTE_RECOVERY_ONSET  = 0.35    # moderate — avoids flooding on piano bleed
-PITCH_HIGH_NOTE_RECOVERY_FRAME  = 0.28
+PITCH_HIGH_NOTE_RECOVERY_ONSET  = 0.35    # base onset threshold at MIDI 69
+PITCH_HIGH_NOTE_RECOVERY_FRAME  = 0.28    # base frame threshold at MIDI 69
 PITCH_HIGH_NOTE_RECOVERY_MIN_MS = 30      # short — high notes can be brief
-PITCH_HIGH_NOTE_RECOVERY_MIN_CONF = 0.25  # frame confidence gate for recovered notes
+PITCH_HIGH_NOTE_RECOVERY_MIN_CONF = 0.25  # global frame confidence floor
+
+# Adaptive threshold scaling: thresholds decay linearly from base (at PITCH_ZERO)
+# down to floor (at PITCH_FULL), recovering more notes at the very top of the range.
+PITCH_HIGH_NOTE_RECOVERY_ONSET_FLOOR = 0.12   # onset floor at MIDI 96+
+PITCH_HIGH_NOTE_RECOVERY_FRAME_FLOOR = 0.08   # frame floor at MIDI 96+
+PITCH_HIGH_NOTE_RECOVERY_PITCH_ZERO  = 69     # full base thresholds here
+PITCH_HIGH_NOTE_RECOVERY_PITCH_FULL  = 96     # floor thresholds reached here
+
+# Onset gate: recovered note must have an onset spike in model_output["onset"]
+# within ±2 frames of its start (unless frame confidence is very high = sustained note).
+PITCH_HIGH_NOTE_RECOVERY_ONSET_GATE = 0.20   # min onset peak to confirm recovery
 
 # ── Sustained note confidence boost ──────────────────────────────────────────
 # Notes that survived the multi-pass merge with a long duration have proven

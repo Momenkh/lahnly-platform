@@ -35,6 +35,7 @@ from .shared.key_detection   import *   # noqa: F401,F403
 from .shared.audio_synthesis import *   # noqa: F401,F403
 from .shared.visualization   import *   # noqa: F401,F403
 from .shared.evaluation      import *   # noqa: F401,F403
+from .shared.spectral        import *   # noqa: F401,F403
 from .shared.presence        import *   # noqa: F401,F403
 
 # ── Guitar ────────────────────────────────────────────────────────────────────

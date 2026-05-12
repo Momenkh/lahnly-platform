@@ -80,3 +80,33 @@ PIANO_STEM_GATE_THRESH  = 0.005
 PIANO_ISOLATION_ENABLED   = True
 PIANO_ISOLATION_WINDOW_S  = 0.800   # piano chords are denser but can have gaps between phrases
 PIANO_ISOLATION_MIN_TOTAL = 15
+
+# Pitch-aware isolation: piano spans wide — allow 2 octaves (24st)
+PIANO_ISOLATION_PITCH_AWARE     = True
+PIANO_ISOLATION_MAX_INTERVAL_ST = 24
+
+# Smart polyphony eviction — piano needs root note protection in chord mode
+PIANO_POLY_ROOT_PROTECTION     = True
+PIANO_POLY_HEIGHT_PENALTY_ST   = 19   # penalise notes >19st above median (3rd octave overtones)
+PIANO_POLY_HEIGHT_PENALTY_COEF = 0.02
+
+# Harmonic overtone dominance ratio for piano (piano fundamentals dominate harmonics more than guitar)
+PIANO_HARMONIC_DOMINANCE_RATIO = 3.0
+
+# Fast-BPM duration filter
+PIANO_BPM_FAST_THRESHOLD_BPM     = 150
+PIANO_BPM_FAST_MELODY_SUBDIV     = 16    # fast runs in melody mode
+PIANO_BPM_FAST_CHORD_SUBDIV      = 10    # chord mode doesn't need as fine a grid
+
+# ── Sustain pedal section detection ──────────────────────────────────────────
+# When many notes are simultaneously active (pedal use), the merge gap is widened
+# to avoid splitting sustained notes that have tiny detection gaps.
+PIANO_SUSTAIN_MIN_CONCURRENT  = 4     # min simultaneous notes to flag as "pedal section"
+PIANO_SUSTAIN_MERGE_GAP_SCALE = 1.5   # multiply merge_gap in high-polyphony (pedal) sections
+
+# ── Attack gate override ─────────────────────────────────────────────────────
+# Disable the global attack gate for piano. Piano notes with sustain pedal
+# fill the pre-window with previous note sustain, making the attack_rms/pre_rms
+# ratio ≈ 1.0 for ALL notes — the gate removes 45%+ of real piano notes.
+# Spectral presence + harmonic coherence already guard against ghost notes.
+PIANO_ATTACK_GATE_ENABLED = False

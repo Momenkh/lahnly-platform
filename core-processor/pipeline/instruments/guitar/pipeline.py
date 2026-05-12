@@ -4,6 +4,9 @@ Extracted from main.py to allow independent testing and registry dispatch.
 """
 
 import os
+import time
+
+from pipeline.shared.stage_executor import StageExecutor
 
 
 def _parse_time(s: str) -> float:
@@ -26,6 +29,8 @@ def _load_saved_tempo() -> dict | None:
 
 
 def run_guitar_pipeline(args) -> None:
+    executor = StageExecutor(args.from_stage)
+
     # ── Stage 1: Instrument Separation ───────────────────────────────────────
     if not args.no_separate and args.from_stage <= 1:
         from pipeline.shared.separation import separate_guitar
@@ -116,7 +121,10 @@ def run_guitar_pipeline(args) -> None:
     # ── Stage 2: Pitch Extraction ─────────────────────────────────────────────
     if args.from_stage <= 2:
         from pipeline.instruments.guitar.pitch import extract_pitches
+        _t0 = time.perf_counter()
         raw_notes = extract_pitches(pitch_input, guitar_type=args.guitar_type, guitar_role=args.guitar_role)
+        executor.timings["2"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 2: {executor.timings['2']:.1f}s")
     elif args.from_stage <= 3:
         from pipeline.instruments.guitar.pitch import load_raw_notes
         print("[Stage 2] Skipped — loading saved raw notes")
@@ -126,7 +134,10 @@ def run_guitar_pipeline(args) -> None:
     # ── Stage 3: Note Cleaning ────────────────────────────────────────────────
     if args.from_stage <= 3:
         from pipeline.instruments.guitar.cleaning import clean_notes
+        _t0 = time.perf_counter()
         cleaned_notes = clean_notes(raw_notes, guitar_type=args.guitar_type, guitar_role=args.guitar_role)
+        executor.timings["3"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 3: {executor.timings['3']:.1f}s")
     else:
         from pipeline.instruments.guitar.cleaning import load_cleaned_notes, load_clean_meta
         print("[Stage 3] Skipped — loading saved cleaned notes")
@@ -142,6 +153,17 @@ def run_guitar_pipeline(args) -> None:
             print(f"[Warning] Results may be inconsistent — re-run with --from-stage 3 "
                   f"to re-clean with '{cur_mode}' settings.")
 
+    # ── Velocity Estimation (between Stage 3 and Stage 4) ────────────────────
+    # Compute per-note MIDI velocity from stem RMS at the attack window.
+    # This adds a "velocity" field to each note that Stage 9 synthesis uses for
+    # realistic dynamics, improving the preview's amplitude match to the stem.
+    from pipeline.shared.separation import get_stem_path
+    _stem_for_vel = get_stem_path()
+    if os.path.isfile(_stem_for_vel):
+        from pipeline.shared.spectral import compute_velocity
+        cleaned_notes = compute_velocity(cleaned_notes, _stem_for_vel)
+        print(f"[Velocity] Estimated velocity for {len(cleaned_notes)} notes")
+
     # ── Stage 4: Tempo Detection & Quantization ───────────────────────────────
     # Save pre-quantization notes for synthesis — quantization snaps timing to a
     # BPM grid which can drift when the original recording has rubato or unstable
@@ -153,19 +175,20 @@ def run_guitar_pipeline(args) -> None:
         from pipeline.shared.quantization import quantize_notes
 
         if args.from_stage <= 4:
-            # Decide whether to reuse a saved BPM
             reuse_tempo = None
             if args.from_stage >= 3 and not args.force_tempo and args.bpm_override is None:
                 reuse_tempo = _load_saved_tempo()
                 if reuse_tempo:
                     print(f"[Stage 4] Saved BPM found ({reuse_tempo['bpm']:.1f}) — "
                           f"reusing (--force-tempo to override)")
-
+            _t0 = time.perf_counter()
             cleaned_notes, tempo_info = quantize_notes(
                 cleaned_notes, pitch_input,
                 bpm_override=args.bpm_override,
                 reuse_tempo=reuse_tempo,
             )
+            executor.timings["4"] = time.perf_counter() - _t0
+            print(f"[Timing] Stage 4: {executor.timings['4']:.1f}s")
         else:
             from pipeline.shared.quantization import load_quantization
             try:
@@ -184,7 +207,10 @@ def run_guitar_pipeline(args) -> None:
     # ── Stage 5: Key / Scale Analysis (global + per-segment) ─────────────────
     if args.from_stage <= 5:
         from pipeline.shared.music_theory import analyze_key_segmented
+        _t0 = time.perf_counter()
         key_info, key_segments = analyze_key_segmented(cleaned_notes, instrument="guitar")
+        executor.timings["5"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 5: {executor.timings['5']:.1f}s")
     else:
         from pipeline.shared.music_theory import load_key_analysis
         try:
@@ -232,9 +258,12 @@ def run_guitar_pipeline(args) -> None:
     capo_fret = key_info.get("capo_fret", 0)
     if args.from_stage <= 6:
         from pipeline.instruments.guitar.mapping import map_to_guitar
+        _t0 = time.perf_counter()
         mapped_notes = map_to_guitar(cleaned_notes, key_info=key_info,
                                      guitar_type=args.guitar_type, guitar_role=args.guitar_role,
                                      capo_fret=capo_fret)
+        executor.timings["6"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 6: {executor.timings['6']:.1f}s")
     else:
         from pipeline.instruments.guitar.mapping import load_mapped_notes
         print("[Stage 6] Skipped — loading saved mapped notes")
@@ -268,12 +297,13 @@ def run_guitar_pipeline(args) -> None:
     # Audio synthesis uses pre-quantization timing so the chroma matches the stem
     # without grid-snapping drift.  Key context (key_info) is still applied via
     # the 5b filters already run on pre_quant_notes.
+    # Always use ALL mapped notes for the audio preview regardless of role — the
+    # preview should sound like the song, not just the top voice. Tab display is
+    # the only output that restricts to melody for lead role.
     audio_mapped = _map(pre_quant_notes, key_info=key_info,
                         guitar_type=args.guitar_type, guitar_role=args.guitar_role,
                         capo_fret=capo_fret, save=False)
-    audio_melody, _ = isolate_melody(audio_mapped,
-                                     min_pitch=MELODY_MIN_PITCH.get(args.guitar_role, 0))
-    audio_notes = audio_melody if args.guitar_role == "lead" else audio_mapped
+    audio_notes = audio_mapped
 
     # ── Stage 7: Chord Detection ──────────────────────────────────────────────
     # harmony_notes excludes fast single-voice runs so they don't trigger
@@ -282,9 +312,12 @@ def run_guitar_pipeline(args) -> None:
     chord_input = harmony_notes if args.guitar_role == "lead" else mapped_notes
     if args.from_stage <= 7:
         from pipeline.instruments.guitar.chords import detect_chords
+        _t0 = time.perf_counter()
         _, chord_groups = detect_chords(
             chord_input, tempo_info=tempo_info, key_info=key_info
         )
+        executor.timings["7"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 7: {executor.timings['7']:.1f}s")
     else:
         from pipeline.instruments.guitar.chords import load_chord_detection
         try:
@@ -301,7 +334,10 @@ def run_guitar_pipeline(args) -> None:
     # lead: melody only (single-voice); rhythm/acoustic: all mapped notes (chord columns)
     if args.from_stage <= 8:
         from pipeline.instruments.guitar.tab import generate_tabs
+        _t0 = time.perf_counter()
         tab_str = generate_tabs(tab_notes, chord_groups=chord_groups, tempo_info=tempo_info, capo_fret=capo_fret)
+        executor.timings["8"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 8: {executor.timings['8']:.1f}s")
     else:
         from pipeline.instruments.guitar.tab import load_tabs
         print("[Stage 8] Skipped — loading saved tabs")
@@ -310,7 +346,10 @@ def run_guitar_pipeline(args) -> None:
     # ── Stage 9: Audio Export + Playback ─────────────────────────────────────
     if args.from_stage <= 9:
         from pipeline.shared.audio import save_audio, play_notes
+        _t0 = time.perf_counter()
         save_audio(audio_notes)
+        executor.timings["9"] = time.perf_counter() - _t0
+        print(f"[Timing] Stage 9: {executor.timings['9']:.1f}s")
         if not args.no_play:
             play_notes(audio_notes)
     else:
@@ -356,4 +395,5 @@ def run_guitar_pipeline(args) -> None:
     else:
         print("[Stage 11] Skipped — visualization disabled")
 
+    executor.print_summary("guitar")
     print("\nDone. All outputs saved to: outputs/")

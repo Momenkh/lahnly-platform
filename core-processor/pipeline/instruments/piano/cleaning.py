@@ -33,6 +33,27 @@ from pipeline.settings import (
     PIANO_ISOLATION_ENABLED,
     PIANO_ISOLATION_WINDOW_S,
     PIANO_ISOLATION_MIN_TOTAL,
+    PIANO_ISOLATION_PITCH_AWARE,
+    PIANO_ISOLATION_MAX_INTERVAL_ST,
+    PIANO_POLY_ROOT_PROTECTION,
+    PIANO_POLY_HEIGHT_PENALTY_ST,
+    PIANO_POLY_HEIGHT_PENALTY_COEF,
+    PIANO_HARMONIC_DOMINANCE_RATIO,
+    PIANO_BPM_FAST_THRESHOLD_BPM,
+    PIANO_BPM_FAST_MELODY_SUBDIV,
+    PIANO_BPM_FAST_CHORD_SUBDIV,
+    PIANO_SUSTAIN_MIN_CONCURRENT,
+    PIANO_SUSTAIN_MERGE_GAP_SCALE,
+    HARMONIC_COHERENCE_ENABLED,
+    HARMONIC_CONF_OVERRIDE,
+    SPECTRAL_PRESENCE_ENABLED,
+    SPECTRAL_PRESENCE_MIN_ENERGY,
+    SPECTRAL_PRESENCE_CONF_OVERRIDE,
+    PIANO_ATTACK_GATE_ENABLED,
+    ATTACK_GATE_PRE_WINDOW_S,
+    ATTACK_GATE_POST_WINDOW_S,
+    ATTACK_GATE_MIN_RATIO,
+    ATTACK_GATE_CONF_OVERRIDE,
     PIANO_HIGH_PITCH_FLOOR_1,
     PIANO_HIGH_PITCH_REDUCTION_1,
     PIANO_HIGH_PITCH_FLOOR_2,
@@ -81,9 +102,12 @@ def clean_notes_piano(
         merge_gap = PIANO_DEFAULT_MERGE_GAP_S
 
     if bpm:
+        _is_melody = piano_mode == "piano_melody"
+        _fast_sub  = PIANO_BPM_FAST_MELODY_SUBDIV if _is_melody else PIANO_BPM_FAST_CHORD_SUBDIV
+        _eff_sub   = _fast_sub if bpm >= PIANO_BPM_FAST_THRESHOLD_BPM else bpm_subdiv
         min_dur = round(
             max(PIANO_BPM_MIN_DUR_CLAMP_MIN_S,
-                min(PIANO_BPM_MIN_DUR_CLAMP_MAX_S, 60.0 / (bpm * bpm_subdiv))), 4)
+                min(PIANO_BPM_MIN_DUR_CLAMP_MAX_S, 60.0 / (bpm * _eff_sub))), 4)
     else:
         min_dur = min_dur_fallback
 
@@ -125,8 +149,16 @@ def clean_notes_piano(
 
     # No bend merging for piano — pianos don't bend pitches
 
+    # Detect pedal-use sections: if many notes are simultaneously active, widen merge gap
+    eff_merge_gap = merge_gap
+    max_concurrent = _max_concurrent_notes_piano(notes)
+    if max_concurrent >= PIANO_SUSTAIN_MIN_CONCURRENT:
+        eff_merge_gap = round(merge_gap * PIANO_SUSTAIN_MERGE_GAP_SCALE, 4)
+        print(f"[Stage 3P] Pedal section detected (max_concurrent={max_concurrent}) "
+              f"→ merge_gap widened to {eff_merge_gap*1000:.0f}ms")
+
     before = len(notes)
-    notes  = _merge_nearby_piano(notes, gap_threshold=merge_gap, merge_ratio=merge_ratio)
+    notes  = _merge_nearby_piano(notes, gap_threshold=eff_merge_gap, merge_ratio=merge_ratio)
     print(f"[Stage 3P] After merging nearby     : {len(notes):4d}  (merged  {before - len(notes)})")
 
     local_max_dev = PIANO_LOCAL_PITCH_MAX_DEV.get(piano_mode)
@@ -142,10 +174,61 @@ def clean_notes_piano(
 
     if PIANO_ISOLATION_ENABLED:
         before = len(notes)
-        notes  = _filter_isolated_notes_piano(notes, PIANO_ISOLATION_WINDOW_S, PIANO_ISOLATION_MIN_TOTAL)
+        if PIANO_ISOLATION_PITCH_AWARE:
+            from pipeline.shared.spectral import filter_isolated_notes_pitch_aware
+            notes = filter_isolated_notes_pitch_aware(
+                notes,
+                window_s=PIANO_ISOLATION_WINDOW_S,
+                min_neighbors=2,
+                max_interval_st=PIANO_ISOLATION_MAX_INTERVAL_ST,
+            )
+        else:
+            notes = _filter_isolated_notes_piano(notes, PIANO_ISOLATION_WINDOW_S, PIANO_ISOLATION_MIN_TOTAL)
         removed = before - len(notes)
         if removed:
             print(f"[Stage 3P] After isolation filter   : {len(notes):4d}  (removed {removed})")
+
+    # Spectral gates — pitch-specific ghost note removal (especially for piano overtones)
+    _stem_p = os.path.join(get_instrument_dir("piano"), "01_stem.wav")
+    if os.path.isfile(_stem_p):
+        from pipeline.shared.spectral import (
+            compute_stem_cqt,
+            check_harmonic_coherence,
+            spectral_presence_gate,
+            attack_envelope_gate,
+        )
+        import librosa as _librosa
+        _cqt, _sr, _hop = compute_stem_cqt(_stem_p)
+        _stem_audio, _sr2 = _librosa.load(_stem_p, sr=22050, mono=True)
+
+        if HARMONIC_COHERENCE_ENABLED:
+            before = len(notes)
+            notes  = check_harmonic_coherence(notes, _cqt, _sr, _hop,
+                                              dominance_ratio=PIANO_HARMONIC_DOMINANCE_RATIO,
+                                              conf_override=HARMONIC_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3P] After harmonic coherence : {len(notes):4d}  (removed {removed} overtones)")
+
+        if SPECTRAL_PRESENCE_ENABLED:
+            before = len(notes)
+            notes  = spectral_presence_gate(notes, _cqt, _sr, _hop,
+                                            min_energy=SPECTRAL_PRESENCE_MIN_ENERGY,
+                                            conf_override=SPECTRAL_PRESENCE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3P] After spectral presence  : {len(notes):4d}  (removed {removed} absent pitches)")
+
+        if PIANO_ATTACK_GATE_ENABLED:
+            before = len(notes)
+            notes  = attack_envelope_gate(notes, _stem_audio, _sr2,
+                                          pre_window_s=ATTACK_GATE_PRE_WINDOW_S,
+                                          post_window_s=ATTACK_GATE_POST_WINDOW_S,
+                                          min_ratio=ATTACK_GATE_MIN_RATIO,
+                                          conf_override=ATTACK_GATE_CONF_OVERRIDE)
+            removed = before - len(notes)
+            if removed:
+                print(f"[Stage 3P] After attack gate        : {len(notes):4d}  (removed {removed} no-ramp notes)")
 
     before = len(notes)
     notes  = _limit_polyphony_piano(notes, max_poly=max_poly)
@@ -268,6 +351,25 @@ def apply_key_octave_correction_piano(notes: list[dict], key_info: dict) -> list
     if corrected:
         print(f"[Stage 5bP] Octave correction: shifted {corrected} notes")
     return result
+
+
+def _max_concurrent_notes_piano(notes: list[dict]) -> int:
+    """Return the maximum number of simultaneously active notes in the list."""
+    if not notes:
+        return 0
+    events = []
+    for n in notes:
+        events.append((n["start"], 0))
+        events.append((n["start"] + n["duration"], 1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    current = peak = 0
+    for _, et in events:
+        if et == 0:
+            current += 1
+            peak = max(peak, current)
+        else:
+            current -= 1
+    return peak
 
 
 def _merge_nearby_piano(notes, gap_threshold, merge_ratio=0.0):
